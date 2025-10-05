@@ -1,5 +1,7 @@
 requests
-discord.py
-pytz
-schedule
 beautifulsoup4
+flask
+pandas
+schedule
+pytz
+bs4
