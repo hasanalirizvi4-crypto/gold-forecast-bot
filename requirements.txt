@@ -1,21 +1,11 @@
-# Fix: Use newer pip first
 pip>=25.2
 setuptools>=70.0.0
 wheel>=0.44.0
-
-# Core bot dependencies
 discord.py==2.3.2
 requests==2.31.0
 pytz==2024.1
 beautifulsoup4==4.12.2
-
-# Hugging Face light packages (no full PyTorch)
 huggingface-hub==0.24.6
 transformers==4.43.3
 sentencepiece==0.1.99
 safetensors==0.4.3
-
-# Replace torch with a *stub* to avoid Render build issues
-torch==2.5.1+cpu ; sys_platform != "linux"
-# Skip installing torch on Render (Linux) to prevent build failure
-
