@@ -1,182 +1,176 @@
 import os
-import time
-import csv
-import random
 import requests
 import pandas as pd
+import numpy as np
+import time
+import logging
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
 from datetime import datetime
-from sklearn.ensemble import RandomForestRegressor
-from transformers import pipeline
-from discord_webhook import DiscordWebhook, DiscordEmbed
+import joblib
 
-# ==============================
-# CONFIG
-# ==============================
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
 HF_TOKEN = os.getenv("HF_TOKEN", "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")
-WEBHOOK_URL = os.getenv(
-    "DISCORD_WEBHOOK",
-    "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-")
+
+PRICE_LOG = "gold_prices.csv"
+MODEL_FILE = "gold_ai_model.pkl"
+CHART_FILE = "gold_chart.png"
+
+CHECK_INTERVAL = 1800  # 30 minutes
+TRAIN_INTERVAL = 10    # Retrain after 10 prices
+SMA_PERIOD = 5         # Simple moving average smoothing
+
+# -----------------------------
+# LOGGING SETUP
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-UPDATE_INTERVAL = 300  # seconds (5 min)
 
-# ==============================
-# AI MODEL (Inference API mode)
-# ==============================
-print("[INFO] Starting Gold AI Bot Pro v2 (API mode)")
-ai_model = pipeline(
-    "text-classification",
-    model="meta-llama/Meta-Llama-3-8B-Instruct",
-    token=HF_TOKEN
-)
-
-# ==============================
-# DISCORD ALERT FUNCTION
-# ==============================
-def send_discord_update(title, message, color="ffcc00"):
-    try:
-        webhook = DiscordWebhook(url=WEBHOOK_URL)
-        embed = DiscordEmbed(title=title, description=message, color=color)
-        embed.set_timestamp()
-        webhook.add_embed(embed)
-        webhook.execute()
-    except Exception as e:
-        print(f"[WARNING] Discord send failed: {e}")
-
-# ==============================
-# MULTI-API GOLD PRICE FETCHER
-# ==============================
+# -----------------------------
+# FETCH GOLD PRICE
+# -----------------------------
 def fetch_gold_price():
-    """Fetch current gold price (USD/oz) from multiple APIs with fallback."""
+    """Fetch gold price from multiple APIs for reliability."""
     urls = [
-        "https://api.metals.live/v1/spot/gold",
+        "https://api.metals.live/v1/spot",
         "https://api.goldapi.io/api/XAU/USD",
-        "https://data-asg.goldprice.org/dbXRates/USD",
-        "https://api.exchangerate.host/latest?base=XAU&symbols=USD"
+        "https://data-asg.goldprice.org/dbXRates/USD"
     ]
-    headers = {
-        "x-access-token": "goldapi-demo-key-12345",  # Replace with real key if you have one
-        "User-Agent": "Mozilla/5.0"
-    }
-
+    headers = {"x-access-token": HF_TOKEN}
     for url in urls:
         try:
             r = requests.get(url, headers=headers, timeout=10)
-            data = r.json()
-
-            if isinstance(data, list) and "gold" in data[0]:
-                return float(data[0]["gold"])
-            elif "price" in data:
-                return float(data["price"])
-            elif "items" in data and "xauPrice" in data["items"][0]:
-                return float(data["items"][0]["xauPrice"])
-            elif "rates" in data and "USD" in data["rates"]:
-                usd_per_ounce = 1 / float(data["rates"]["USD"])
-                return round(usd_per_ounce, 2)
-
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return float(data[0]["gold"])
+                elif "price" in data:
+                    return float(data["price"])
+                elif "items" in data:
+                    return float(data["items"][0]["xauPrice"])
         except Exception as e:
-            print(f"[WARNING] Could not fetch price from {url}: {e}")
-            time.sleep(random.uniform(1, 3))
-            continue
-
-    print("[ERROR] Could not retrieve gold price from any API.")
+            logging.warning(f"Failed {url}: {e}")
     return None
 
-# ==============================
-# AI MARKET ANALYSIS
-# ==============================
-def analyze_market(price):
-    if not price:
-        return "Could not fetch price", 0.0
+# -----------------------------
+# DISCORD MESSAGE HANDLER
+# -----------------------------
+def send_to_discord(message, image_path=None):
+    """Send text and optional image to Discord."""
+    if not DISCORD_WEBHOOK:
+        logging.warning("Discord webhook not set.")
+        return
 
-    text = f"Gold price is {price} USD. Should we buy or sell?"
-    result = ai_model(text)[0]
-    confidence = round(result["score"] * 100, 2)
+    data = {"content": message}
+    files = {}
 
-    if confidence < 80:
-        return f"⚠️ Market uncertain (confidence {confidence}%)", confidence
+    if image_path and os.path.exists(image_path):
+        files = {"file": open(image_path, "rb")}
 
-    label = result["label"].lower()
-    if "buy" in label:
-        return f"🟢 Buy Zone Detected — Confidence: {confidence}%\nPrice: {price} USD", confidence
-    elif "sell" in label:
-        return f"🔴 Sell Zone Detected — Confidence: {confidence}%\nPrice: {price} USD", confidence
+    try:
+        requests.post(DISCORD_WEBHOOK, data=data, files=files)
+    except Exception as e:
+        logging.error(f"Error sending Discord message: {e}")
+
+# -----------------------------
+# DATA LOGGING
+# -----------------------------
+def save_price(price):
+    """Save timestamp and price to CSV."""
+    df = pd.DataFrame([[datetime.now(), price]], columns=["timestamp", "price"])
+    if os.path.exists(PRICE_LOG):
+        df.to_csv(PRICE_LOG, mode="a", header=False, index=False)
     else:
-        return f"⚖️ Hold/Wait — Confidence: {confidence}%", confidence
+        df.to_csv(PRICE_LOG, index=False)
 
-# ==============================
-# SELF-LEARNING SYSTEM
-# ==============================
-def log_price(price):
-    os.makedirs("data", exist_ok=True)
-    filepath = "data/gold_price_history.csv"
-    with open(filepath, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now(), price])
+# -----------------------------
+# CHARTING
+# -----------------------------
+def plot_chart():
+    """Generate chart with price and moving average."""
+    if not os.path.exists(PRICE_LOG):
+        return
+    df = pd.read_csv(PRICE_LOG)
+    df["SMA"] = df["price"].rolling(SMA_PERIOD).mean()
 
-def train_model():
-    filepath = "data/gold_price_history.csv"
-    if not os.path.exists(filepath):
-        print("[INFO] No training data yet.")
+    plt.figure(figsize=(8, 4))
+    plt.plot(df["timestamp"], df["price"], label='Gold Price', color='gold', linewidth=2)
+    plt.plot(df["timestamp"], df["SMA"], label=f'{SMA_PERIOD}-Period SMA', color='blue', linestyle='--')
+    plt.xlabel("Time")
+    plt.ylabel("Price (USD)")
+    plt.title("Gold Price Trend with SMA")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.legend()
+    plt.savefig(CHART_FILE)
+    plt.close()
+
+# -----------------------------
+# AI MODEL TRAINING
+# -----------------------------
+def train_and_predict():
+    """Train or update model and predict next gold price."""
+    if not os.path.exists(PRICE_LOG):
         return None
 
-    df = pd.read_csv(filepath, header=None, names=["timestamp", "price"])
-    if len(df) < 20:
-        print("[INFO] Not enough data to train yet.")
+    df = pd.read_csv(PRICE_LOG)
+    if len(df) < SMA_PERIOD + 5:
         return None
 
-    df["time_index"] = range(len(df))
-    X = df[["time_index"]]
-    y = df["price"]
+    # Smooth prices using moving average
+    df["SMA"] = df["price"].rolling(SMA_PERIOD).mean().fillna(method="bfill")
 
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    df["time_idx"] = np.arange(len(df))
+    X = df[["time_idx"]]
+    y = df["SMA"]
+
+    # Load existing model if available
+    if os.path.exists(MODEL_FILE):
+        model = joblib.load(MODEL_FILE)
+        logging.info("Loaded existing AI model.")
+    else:
+        model = LinearRegression()
+
+    # Train the model
     model.fit(X, y)
-    print(f"[INFO] Model trained on {len(df)} points.")
-    return model
+    joblib.dump(model, MODEL_FILE)
 
-def predict_next_price(model):
-    if model is None:
-        return None
-    next_index = model.n_features_in_
-    return model.predict([[next_index]])[0]
+    next_idx = np.array([[len(df)]])
+    predicted = model.predict(next_idx)[0]
+    last_price = df["price"].iloc[-1]
+    trend = "📈 UP" if predicted > last_price else "📉 DOWN"
 
-# ==============================
+    return predicted, trend
+
+# -----------------------------
 # MAIN LOOP
-# ==============================
-def main():
-    send_discord_update("🤖 Gold AI Bot Started", "Monitoring live gold markets with AI insights.")
-    while True:
-        try:
-            price = fetch_gold_price()
-            if not price:
-                send_discord_update("⚠️ Gold Price Alert", "Could not fetch gold price!", color="ff0000")
-                time.sleep(UPDATE_INTERVAL)
-                continue
+# -----------------------------
+logging.info("🚀 Starting Gold AI Bot Pro v7 (Smart Market Learning Edition)")
+counter = 0
 
-            print(f"[PRICE] 💰 Gold Price: {price} USD")
-            log_price(price)
+while True:
+    price = fetch_gold_price()
+    if price:
+        save_price(price)
+        logging.info(f"💰 Gold Price: ${price}")
+        send_to_discord(f"💰 Current Gold Price: ${price}")
 
-            # Train and predict future trend
-            model = train_model()
-            if model:
-                prediction = predict_next_price(model)
-                if prediction:
-                    print(f"[AI PREDICTION] Next expected price ≈ {prediction:.2f} USD")
-                    send_discord_update("📈 AI Predicted Next Price", f"≈ ${prediction:.2f}")
+        counter += 1
+        if counter % TRAIN_INTERVAL == 0:
+            result = train_and_predict()
+            if result:
+                predicted, trend = result
+                plot_chart()
+                msg = f"🤖 AI Prediction: Next Price ≈ ${predicted:.2f} | Trend: {trend}"
+                logging.info(msg)
+                send_to_discord(msg, image_path=CHART_FILE)
+    else:
+        logging.warning("⚠️ Could not fetch gold price from any source.")
+        send_to_discord("⚠️ Could not fetch gold price from any source.")
 
-            # AI analysis
-            analysis, confidence = analyze_market(price)
-            print(f"[ANALYSIS] {analysis}")
-
-            if confidence >= 80:
-                send_discord_update("Gold AI Signal", analysis, color="03fc88")
-            else:
-                send_discord_update("Gold Market Update", f"Price: {price}\n{analysis}", color="ffcc00")
-
-        except Exception as e:
-            send_discord_update("⚠️ Bot Error", str(e), color="ff0000")
-
-        time.sleep(UPDATE_INTERVAL)
-
-# ==============================
-if __name__ == "__main__":
-    main()
+    time.sleep(CHECK_INTERVAL)
