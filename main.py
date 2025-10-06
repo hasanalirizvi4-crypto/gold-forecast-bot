@@ -37,7 +37,7 @@ from torch.utils.data import TensorDataset, DataLoader
 # CONFIG (environment)
 # -------------------------
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")  # optional
+GOLD_API_KEY = os.getenv("GOLD_API_KEY", "goldapi-favtsmgcmdotp-io")  # optional
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", str(3600)))  # default hourly
 DATA_DIR = os.getenv("DATA_DIR", "data")
 HISTORY_CSV = os.path.join(DATA_DIR, "price_history.csv")
