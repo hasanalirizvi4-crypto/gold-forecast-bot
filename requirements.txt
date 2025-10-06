@@ -1,6 +1,6 @@
 requests
-transformers
-torch
-huggingface-hub
-python-dotenv
-discord-webhook
+pandas
+numpy
+scikit-learn
+matplotlib
+joblib
