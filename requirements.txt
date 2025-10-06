@@ -1,4 +1,6 @@
 requests
-pandas
-scikit-learn
-
+transformers
+torch
+huggingface-hub
+python-dotenv
+discord-webhook
