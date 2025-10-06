@@ -1,169 +1,124 @@
 import os
-import time
-import logging
+import csv
 import requests
-from discord_webhook import DiscordWebhook, DiscordEmbed
-from transformers import pipeline
+import pandas as pd
+from datetime import datetime
+from sklearn.ensemble import RandomForestRegressor
 
-# ========================
+# ==============================================
 # CONFIGURATION
-# ========================
-UPDATE_INTERVAL = 300  # 5 minutes
+# ==============================================
+HF_TOKEN = "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"
+DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
 
-# Load environment variables
-HF_TOKEN = os.getenv("HF_TOKEN")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-
-# Logging setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-print("HF_TOKEN detected:", bool(HF_TOKEN))
-print("DISCORD_WEBHOOK detected:", bool(DISCORD_WEBHOOK))
-
-if not HF_TOKEN:
-    logging.warning("⚠️ HF_TOKEN not set. Please add it as an environment variable.")
-else:
-    logging.info("✅ Hugging Face token loaded successfully.")
-
-if not DISCORD_WEBHOOK:
-    logging.warning("⚠️ DISCORD_WEBHOOK not set. Please add it as an environment variable.")
-else:
-    logging.info("✅ Discord webhook loaded successfully.")
-
-# ========================
-# AI SETUP
-# ========================
-try:
-    ai_model = pipeline(
-        "text-classification",
-        model="meta-llama/Meta-Llama-3-8B-Instruct",
-        token=HF_TOKEN
-    )
-    logging.info("✅ LLaMA AI model loaded successfully.")
-except Exception as e:
-    logging.error(f"❌ Failed to load AI model: {e}")
-    ai_model = None
-
-# ========================
-# MULTI-SOURCE GOLD PRICE FETCHER
-# ========================
-def fetch_gold_price():
-    """Fetch live gold price from multiple reliable APIs with fallback."""
-    sources = [
-        {
-            "name": "Metals.Live",
-            "url": "https://api.metals.live/v1/spot/gold",
-            "parser": lambda d: float(d[0]["gold"]) if isinstance(d, list) and "gold" in d[0] else None
-        },
-        {
-            "name": "GoldAPI.io",
-            "url": "https://www.goldapi.io/api/XAU/USD",
-            "headers": {"x-access-token": "goldapi-demo-token"},
-            "parser": lambda d: float(d.get("price", 0)) if d.get("price") else None
-        },
-        {
-            "name": "Metals-API",
-            "url": "https://api.metals-api.com/v1/latest?access_key=demo&symbols=XAU",
-            "parser": lambda d: float(d["rates"]["XAU"]) if "rates" in d and "XAU" in d["rates"] else None
-        },
-        {
-            "name": "Yahoo Finance",
-            "url": "https://query1.finance.yahoo.com/v7/finance/quote?symbols=GC=F",
-            "parser": lambda d: float(d["quoteResponse"]["result"][0]["regularMarketPrice"])
-            if "quoteResponse" in d and d["quoteResponse"]["result"] else None
-        },
-        {
-            "name": "TradingEconomics",
-            "url": "https://api.tradingeconomics.com/markets/commodity/gold?c=guest:guest",
-            "parser": lambda d: float(d[0]["last"]) if isinstance(d, list) and "last" in d[0] else None
-        }
+# ==============================================
+# FETCH GOLD PRICE (multiple APIs for redundancy)
+# ==============================================
+def get_gold_price():
+    urls = [
+        "https://api.metals.live/v1/spot/gold",
+        "https://www.goldapi.io/api/XAU/USD",
+        "https://api.exchangerate.host/latest?base=XAU&symbols=USD"
     ]
+    headers = {"x-access-token": HF_TOKEN}
 
-    for s in sources:
+    for url in urls:
         try:
-            logging.info(f"🌐 Trying {s['name']}...")
-            r = requests.get(s["url"], headers=s.get("headers", {}), timeout=10)
-            if r.status_code != 200:
-                logging.warning(f"{s['name']} returned status {r.status_code}")
-                continue
-            data = r.json()
-            price = s["parser"](data)
-            if price:
-                logging.info(f"✅ {s['name']} success — Price: {price} USD")
-                return price
-        except Exception as e:
-            logging.warning(f"❌ Error fetching from {s['name']}: {e}")
-
-    logging.warning("⚠️ Could not fetch price from any source.")
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                # Handle different API response formats
+                if isinstance(data, list):
+                    return float(data[0]["gold"])
+                elif "price" in data:
+                    return float(data["price"])
+                elif "rates" in data:
+                    return float(1 / data["rates"]["USD"])
+        except Exception:
+            continue
+    print("[WARNING] Could not fetch price from any source")
     return None
 
-# ========================
-# AI ANALYSIS
-# ========================
-def analyze_market(price):
-    """Use AI to evaluate whether it's a good buy or sell zone."""
-    if not ai_model or not price:
-        return "Could not fetch price or load model", 0.0
-
-    text = f"Gold price is {price} USD. Should we buy or sell?"
-    result = ai_model(text)[0]
-    confidence = round(result['score'] * 100, 2)
-
-    if confidence < 80:
-        return f"⚠️ Market uncertain (confidence {confidence}%)", confidence
-
-    label = result['label'].lower()
-    if "buy" in label:
-        return f"🟢 Buy Zone Detected — Confidence: {confidence}%\nPrice: {price} USD", confidence
-    elif "sell" in label:
-        return f"🔴 Sell Zone Detected — Confidence: {confidence}%\nPrice: {price} USD", confidence
-    else:
-        return f"⚖️ Hold/Wait — Confidence: {confidence}%\nPrice: {price} USD", confidence
-
-# ========================
-# DISCORD ALERT
-# ========================
-def send_discord_update(title, message, color='ffcc00'):
-    """Send update to Discord webhook."""
+# ==============================================
+# DISCORD ALERT FUNCTION
+# ==============================================
+def send_discord_alert(message):
     if not DISCORD_WEBHOOK:
-        logging.warning("Discord webhook not configured; skipping send.")
+        print("[WARNING] Discord webhook not configured; skipping send.")
         return
     try:
-        webhook = DiscordWebhook(url=DISCORD_WEBHOOK)
-        embed = DiscordEmbed(title=title, description=message, color=color)
-        embed.set_timestamp()
-        webhook.add_embed(embed)
-        webhook.execute()
-        logging.info(f"📩 Sent update to Discord: {title}")
+        data = {"content": message}
+        res = requests.post(DISCORD_WEBHOOK, json=data)
+        if res.status_code == 204:
+            print("[INFO] Discord alert sent successfully.")
+        else:
+            print(f"[WARNING] Discord response: {res.status_code}")
     except Exception as e:
-        logging.error(f"❌ Failed to send Discord message: {e}")
+        print("[ERROR] Discord send failed:", e)
 
-# ========================
+# ==============================================
+# GOLD AI LEARNING SYSTEM
+# ==============================================
+def log_price(price):
+    if not os.path.exists("data"):
+        os.makedirs("data")
+    filepath = "data/gold_price_history.csv"
+    with open(filepath, "a", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([datetime.now(), price])
+
+def train_model():
+    filepath = "data/gold_price_history.csv"
+    if not os.path.exists(filepath):
+        print("[INFO] No training data yet.")
+        return None
+
+    df = pd.read_csv(filepath, header=None, names=["timestamp", "price"])
+    if len(df) < 20:
+        print("[INFO] Not enough data to train yet.")
+        return None
+
+    df["time_index"] = range(len(df))
+    X = df[["time_index"]]
+    y = df["price"]
+
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    print("[INFO] Model trained on", len(df), "data points.")
+    return model
+
+def predict_next_price(model):
+    if model is None:
+        return None
+    next_index = model.n_features_in_
+    prediction = model.predict([[next_index]])[0]
+    return prediction
+
+# ==============================================
 # MAIN LOOP
-# ========================
+# ==============================================
 def main():
-    send_discord_update("🤖 Gold AI Bot Started", "Monitoring live gold markets with AI insights.")
-    while True:
-        try:
-            price = fetch_gold_price()
-            if price:
-                logging.info(f"💰 Gold Price: {price}")
-                analysis, confidence = analyze_market(price)
-                if confidence >= 80:
-                    send_discord_update("Gold AI Signal", analysis, color='03fc88')
-                else:
-                    send_discord_update("Gold Market Update", analysis, color='ffcc00')
-            else:
-                send_discord_update("Gold Price Alert", "⚠️ Could not fetch gold price!", color='ff0000')
-        except Exception as e:
-            logging.error(f"❌ Error in main loop: {e}")
-            send_discord_update("⚠️ Error in Bot", str(e), color='ff0000')
+    print("[INFO] Starting Gold AI Bot Pro v2 (Self-Learning Mode)")
+    price = get_gold_price()
+    if not price:
+        print("[ERROR] Could not retrieve gold price.")
+        return
 
-        time.sleep(UPDATE_INTERVAL)
+    print(f"[DATA] Current gold price: ${price:.2f}")
+    send_discord_alert(f"💰 Current gold price: ${price:.2f}")
 
-# ========================
-# ENTRY POINT
-# ========================
+    # Log and learn
+    log_price(price)
+    model = train_model()
+
+    # Predict next price
+    if model:
+        predicted = predict_next_price(model)
+        if predicted:
+            print(f"[AI PREDICTION] Next expected price: ${predicted:.2f}")
+            send_discord_alert(f"🤖 Gold AI Prediction: Next price ≈ ${predicted:.2f}")
+    else:
+        print("[INFO] Waiting for more data to train AI model...")
+
 if __name__ == "__main__":
-    logging.info("🚀 Starting Gold AI Bot Pro v2 (LLaMA, multi-source mode)")
     main()
