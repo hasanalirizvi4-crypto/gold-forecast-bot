@@ -1,149 +1,110 @@
-import sys
-import types
+import sys, types
+import time
+import requests
+from datetime import datetime
+import pytz
+from discord import SyncWebhook, Embed
 
-# Patch for Python 3.13 where audioop is removed
+# 🩹 Patch for Python 3.13 — fixes missing audioop issue
 if 'audioop' not in sys.modules:
     sys.modules['audioop'] = types.ModuleType('audioop')
 
-
-import os
-import requests
-from discord import SyncWebhook, Embed
-from datetime import datetime, timedelta
-import pytz
-import time
-
-# =============== CONFIGURATION ===============
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Add this in Render environment variables
+# ====== CONFIGURATION ======
+WEBHOOK_URL = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
 TIMEZONE = pytz.timezone("Asia/Karachi")
-SEND_HOUR = 8  # Send at 8 AM Pakistan time
-# =============================================
 
-# === GOLD PRICE FETCHER (Multiple Sources) ===
+# ====== FUNCTIONS ======
+
+# --- Gold price fetcher with retry ---
 def get_gold_price():
-    """Fetch the latest gold price from multiple sources for reliability."""
-    try:
-        # 🥇 Primary source: Metals.live (no API key)
-        url1 = "https://api.metals.live/v1/spot"
-        response1 = requests.get(url1, timeout=10)
-        data1 = response1.json()
-        for item in data1:
-            if "gold" in item:
-                return float(item["gold"])
-    except Exception as e:
-        print("Primary source failed:", e)
+    for _ in range(3):  # Try up to 3 times
+        try:
+            response = requests.get("https://data-asg.goldprice.org/dbXRates/USD", timeout=5)
+            data = response.json()
+            return float(data["items"][0]["xauPrice"])
+        except Exception:
+            time.sleep(2)
+    return None
 
-    try:
-        # 🥈 Secondary source: GoldAPI.io
-        headers = {"x-access-token": "goldapi-favtsmgcmdotp-io", "Content-Type": "application/json"}
-        response2 = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
-        data2 = response2.json()
-        if "price" in data2:
-            return float(data2["price"])
-    except Exception as e:
-        print("Secondary source failed:", e)
-
-    try:
-        # 🥉 Backup source: Metals-API (unofficial)
-        url3 = "https://metals-api.com/api/latest?base=USD&symbols=XAU"
-        response3 = requests.get(url3, timeout=10)
-        data3 = response3.json()
-        if "rates" in data3 and "XAU" in data3["rates"]:
-            return 1 / float(data3["rates"]["XAU"])
-    except Exception as e:
-        print("Backup source failed:", e)
-
-    return None  # If all failed
-
-# === SENTIMENT + BUY/SELL LEVELS ===
+# --- Sentiment Analysis (using ForexFactory calendar sentiment) ---
 def get_sentiment():
-    """Generate simulated sentiment data (can be upgraded with ForexFactory parsing)."""
     try:
-        sentiment = {
-            "Overall Sentiment": "Bullish",
-            "Market Confidence": "Moderate",
-            "ETF Flow": "Inflow",
-            "USD Strength": "Weak",
-        }
-        return sentiment
-    except Exception as e:
-        print("Error fetching sentiment:", e)
-        return None
+        news_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        response = requests.get(news_url, timeout=10)
+        events = response.json()
 
-def get_zones(price):
-    """Derive buy/sell zones using technical confluence (daily range logic)."""
-    if not price:
-        return None, None
+        gold_related = [e for e in events if "USD" in e.get("country", "") or "gold" in e.get("title", "").lower()]
+        impact_summary = {"High": 0, "Medium": 0, "Low": 0}
+        upcoming = []
 
-    # Simulate support/resistance zones using small percent offsets
-    buy_zone_low = round(price * 0.995, 2)
-    buy_zone_high = round(price * 0.997, 2)
-    sell_zone_low = round(price * 1.003, 2)
-    sell_zone_high = round(price * 1.005, 2)
+        for event in gold_related:
+            impact = event.get("impact", "Low")
+            if impact in impact_summary:
+                impact_summary[impact] += 1
+            upcoming.append(event.get("title", "Unknown Event"))
 
-    return (buy_zone_low, buy_zone_high), (sell_zone_low, sell_zone_high)
+        overall = "Neutral"
+        if impact_summary["High"] >= 3:
+            overall = "Volatile"
+        elif impact_summary["Medium"] >= 2:
+            overall = "Cautious Bullish"
 
-# === DISCORD MESSAGE SENDER ===
+        return overall, impact_summary, upcoming[:5]
+
+    except Exception:
+        return "Unknown", {}, []
+
+# --- Define support/resistance zones dynamically ---
+def calculate_zones(price):
+    support_zone = round(price - 10, 2)
+    resistance_zone = round(price + 10, 2)
+    buy_zone = f"{support_zone - 5}–{support_zone}"
+    sell_zone = f"{resistance_zone}–{resistance_zone + 5}"
+    return buy_zone, sell_zone
+
+# --- Send daily update ---
 def send_discord_update():
+    price = get_gold_price()
+    sentiment, sentiment_details, upcoming = get_sentiment()
+
+    if price:
+        buy_zone, sell_zone = calculate_zones(price)
+        embed = Embed(
+            title="🏆 Daily Gold Forecast",
+            description=f"**Live Gold Price:** ${price}\n\n**Sentiment:** {sentiment}",
+            color=0xFFD700,
+            timestamp=datetime.now(TIMEZONE)
+        )
+        embed.add_field(name="📈 Buy Zone", value=f"`{buy_zone}`", inline=True)
+        embed.add_field(name="📉 Sell Zone", value=f"`{sell_zone}`", inline=True)
+        embed.add_field(name="🧠 Sentiment Breakdown", value='\n'.join([f"{k}: {v}" for k, v in sentiment_details.items()]), inline=False)
+        embed.add_field(name="📰 Upcoming USD/Gold Events", value="\n".join(upcoming) if upcoming else "No major events.", inline=False)
+        embed.set_footer(text="Automated Gold Market Update | Source: ForexFactory & GoldPrice.org")
+
+    else:
+        embed = Embed(
+            title="⚠️ Could Not Fetch Gold Price",
+            description="The system couldn’t retrieve the current gold rate. Will retry in the next cycle.",
+            color=0xFF0000,
+            timestamp=datetime.now(TIMEZONE)
+        )
+
     webhook = SyncWebhook.from_url(WEBHOOK_URL)
-    embed = Embed(
-        title="🏆 Daily Gold Forecast Update",
-        description="Comprehensive gold forecast and trading zones for the day.",
-        color=0xFFD700,
-        timestamp=datetime.now(TIMEZONE)
-    )
-
-    gold_price = get_gold_price()
-    sentiment_details = get_sentiment()
-
-    # --- Price Section ---
-    if gold_price:
-        embed.add_field(name="🏅 Spot Gold Price (USD/oz)", value=f"${gold_price:,}", inline=False)
-    else:
-        embed.add_field(name="🏅 Spot Gold Price (USD/oz)", value="⚠️ Could not fetch gold price", inline=False)
-
-    # --- Zones Section ---
-    buy_zone, sell_zone = get_zones(gold_price)
-    if buy_zone and sell_zone:
-        embed.add_field(
-            name="💰 Buy Zone",
-            value=f"{buy_zone[0]} – {buy_zone[1]}",
-            inline=True
-        )
-        embed.add_field(
-            name="📈 Sell Zone",
-            value=f"{sell_zone[0]} – {sell_zone[1]}",
-            inline=True
-        )
-    else:
-        embed.add_field(name="💰 Zones", value="Unavailable", inline=False)
-
-    # --- Sentiment Section ---
-    if sentiment_details:
-        sentiment_text = "\n".join([f"**{k}:** {v}" for k, v in sentiment_details.items()])
-        embed.add_field(name="🧠 Market Sentiment", value=sentiment_text, inline=False)
-    else:
-        embed.add_field(name="🧠 Market Sentiment", value="⚠️ Could not fetch sentiment data", inline=False)
-
-    embed.set_footer(text="Auto Gold Forecast Bot • Powered by Hasan Ali")
-
     webhook.send(embed=embed)
-    print(f"✅ Update sent successfully at {datetime.now(TIMEZONE)}")
 
-# === SCHEDULER ===
-def run_scheduler():
-    print("🚀 Gold Forecast Bot is running and waiting for 8 AM Pakistan time...")
+# ====== SCHEDULER ======
+def run_bot():
+    print("✅ Gold Forecast Bot Running 24/7...")
     while True:
         now = datetime.now(TIMEZONE)
-        target_time = now.replace(hour=SEND_HOUR, minute=0, second=0, microsecond=0)
-
-        # If time is between 8:00 and 8:01 AM → send update
-        if now >= target_time and now < target_time + timedelta(minutes=1):
+        # Run daily report at 7 AM Pakistan time
+        if now.hour == 7 and now.minute == 0:
             send_discord_update()
-            time.sleep(60)  # Prevent duplicate sends
-        time.sleep(30)
+            time.sleep(60)  # Wait 1 min to avoid multiple sends
+        else:
+            time.sleep(30)
 
-# === MAIN ===
+# ====== MAIN EXECUTION ======
 if __name__ == "__main__":
-    send_discord_update()  # Send immediately when started
-    run_scheduler()
+    send_discord_update()  # Optional: send one at startup
+    run_bot()
