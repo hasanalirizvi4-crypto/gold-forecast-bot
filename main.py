@@ -1,3 +1,11 @@
+import sys
+import types
+
+# Patch for Python 3.13 where audioop is removed
+if 'audioop' not in sys.modules:
+    sys.modules['audioop'] = types.ModuleType('audioop')
+
+
 import os
 import requests
 from discord import SyncWebhook, Embed
