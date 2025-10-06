@@ -1,153 +1,181 @@
 import sys
 import types
 import os
-import time
-import pytz
 import requests
-from datetime import datetime, timedelta
 from discord import SyncWebhook, Embed
+from datetime import datetime, timedelta
+import pytz
+import time
+from transformers import pipeline
 
-# === PATCH for Python 3.13 missing audioop ===
+# --- Patch for Python 3.13 (audioop removed) ---
 if 'audioop' not in sys.modules:
     sys.modules['audioop'] = types.ModuleType('audioop')
 
-# =============== CONFIGURATION ===============
+# --- CONFIG ---
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN", "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")  # your Hugging Face token
 TIMEZONE = pytz.timezone("Asia/Karachi")
-SEND_HOUR = 8  # Daily forecast time (8 AM Pakistan)
-# =============================================
+SEND_HOUR = 8  # Pakistan time for daily report
 
-# === 1. FETCH GOLD PRICE (Yahoo Finance) ===
+# === Load Hugging Face model ===
+ai = pipeline("text-generation", model="distilbert-base-uncased", device="cpu")
+
+# === Multiple gold price APIs ===
 def get_gold_price():
-    try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        return float(price)
-    except Exception as e:
-        print("Error fetching gold price:", e)
-        return None
+    """Fetch gold price from multiple APIs for accuracy"""
+    sources = [
+        ("Metals.Live", "https://api.metals.live/v1/spot"),
+        ("GoldAPI.io", "https://www.goldapi.io/api/XAU/USD"),
+        ("TwelveData", "https://api.twelvedata.com/price?symbol=XAU/USD&apikey=demo"),
+        ("BullionVault", "https://data-asg.goldprice.org/dbXRates/USD"),
+    ]
+    headers = {
+        "x-access-token": "goldapi-favtsmgcmdotp-io",
+        "Content-Type": "application/json"
+    }
 
-# === 2. AI SENTIMENT ANALYSIS (Hugging Face) ===
-def get_ai_sentiment(text="Gold market sentiment today"):
-    try:
-        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-        payload = {"inputs": text}
-        response = requests.post("https://api-inference.huggingface.co/models/ProsusAI/finbert", headers=headers, json=payload, timeout=15)
-        result = response.json()
+    for name, url in sources:
+        try:
+            resp = requests.get(url, headers=headers if "goldapi" in url else {}, timeout=10)
+            data = resp.json()
 
-        if isinstance(result, list) and len(result) > 0 and "label" in result[0]:
-            label = result[0]["label"]
-            score = result[0]["score"]
-            return f"{label} ({round(score * 100, 2)}%)"
-        return "Neutral (AI Uncertain)"
+            # Metals.live
+            if name == "Metals.Live" and isinstance(data, list):
+                for d in data:
+                    if "gold" in d:
+                        return float(d["gold"])
+
+            # GoldAPI.io
+            elif name == "GoldAPI.io" and "price" in data:
+                return float(data["price"])
+
+            # TwelveData
+            elif name == "TwelveData" and "price" in data:
+                return float(data["price"])
+
+            # BullionVault
+            elif name == "BullionVault" and "items" in data:
+                return float(data["items"][0]["xauPrice"])
+        except Exception as e:
+            print(f"{name} failed →", e)
+            continue
+
+    return None
+
+
+# === SENTIMENT SECTION ===
+def get_sentiment():
+    """Generate gold sentiment using Hugging Face AI"""
+    try:
+        prompt = (
+            "Analyze gold market sentiment for today considering USD strength, inflation, "
+            "interest rates, and geopolitical factors. Give short result as Bullish, Bearish, or Neutral "
+            "with confidence level."
+        )
+
+        ai_result = ai(prompt, max_length=120, num_return_sequences=1)
+        analysis = ai_result[0]["generated_text"]
+
+        if "bullish" in analysis.lower():
+            overall = "Bullish"
+        elif "bearish" in analysis.lower():
+            overall = "Bearish"
+        else:
+            overall = "Neutral"
+
+        return {
+            "Overall Sentiment": overall,
+            "Confidence": "High" if "80" in analysis or "strong" in analysis else "Moderate",
+            "AI Insight": analysis.strip(),
+        }
+
     except Exception as e:
         print("AI sentiment error:", e)
-        return "Neutral (Fetch Failed)"
+        return {"Overall Sentiment": "Neutral", "Confidence": "Low", "AI Insight": "Fallback mode used"}
 
-# === 3. TECHNICAL ZONES ===
+
+# === ZONE DETECTOR ===
 def get_zones(price):
+    """Calculate strong buy/sell zones dynamically based on price"""
     if not price:
         return None, None
 
-    # Support / resistance calculation
     buy_zone_low = round(price * 0.995, 2)
     buy_zone_high = round(price * 0.997, 2)
     sell_zone_low = round(price * 1.003, 2)
     sell_zone_high = round(price * 1.005, 2)
+
     return (buy_zone_low, buy_zone_high), (sell_zone_low, sell_zone_high)
 
-# === 4. PROBABILITY ESTIMATOR ===
-def calculate_confidence(sentiment):
-    sentiment = sentiment.lower()
-    if "positive" in sentiment or "bullish" in sentiment:
-        return 85
-    elif "negative" in sentiment or "bearish" in sentiment:
-        return 85
-    else:
-        return 60
 
-# === 5. DISCORD EMBED SENDER ===
-def send_discord_update(title, description, color=0xFFD700):
+# === PROBABILITY CHECK ===
+def check_probability(sentiment):
+    """Estimate trade confidence"""
+    conf_map = {"High": 90, "Moderate": 75, "Low": 50}
+    return conf_map.get(sentiment.get("Confidence", "Low"), 50)
+
+
+# === DISCORD UPDATE ===
+def send_discord_update():
     webhook = SyncWebhook.from_url(WEBHOOK_URL)
     embed = Embed(
-        title=title,
-        description=description,
-        color=color,
+        title="🏆 Gold AI Forecast",
+        description="Comprehensive daily and intraday analysis powered by AI 🤖",
+        color=0xFFD700,
         timestamp=datetime.now(TIMEZONE)
     )
-    embed.set_footer(text="AI Gold Forecast Bot • Powered by Hasan Ali")
+
+    gold_price = get_gold_price()
+    sentiment = get_sentiment()
+
+    # --- PRICE ---
+    if gold_price:
+        embed.add_field(name="🏅 Current Gold Price (USD/oz)", value=f"${gold_price:,}", inline=False)
+    else:
+        embed.add_field(name="🏅 Current Gold Price (USD/oz)", value="⚠️ Could not fetch gold price", inline=False)
+
+    # --- ZONES ---
+    buy_zone, sell_zone = get_zones(gold_price)
+    if buy_zone and sell_zone:
+        embed.add_field(name="💰 Buy Zone", value=f"{buy_zone[0]} – {buy_zone[1]}", inline=True)
+        embed.add_field(name="📈 Sell Zone", value=f"{sell_zone[0]} – {sell_zone[1]}", inline=True)
+    else:
+        embed.add_field(name="💰 Zones", value="Unavailable", inline=False)
+
+    # --- SENTIMENT ---
+    sentiment_text = "\n".join([f"**{k}:** {v}" for k, v in sentiment.items()])
+    embed.add_field(name="🧠 Market Sentiment", value=sentiment_text, inline=False)
+
+    # --- ALERT ---
+    confidence = check_probability(sentiment)
+    if confidence >= 80:
+        embed.add_field(
+            name="🚨 Trade Alert",
+            value="High-confidence trade setup detected! Monitor gold closely 🔥",
+            inline=False
+        )
+
+    embed.set_footer(text="Gold AI Bot • by Hasan Ali • Powered by Hugging Face")
+
     webhook.send(embed=embed)
-    print(f"✅ Sent update: {title}")
+    print(f"✅ Update sent at {datetime.now(TIMEZONE)} | Confidence: {confidence}%")
 
-# === 6. DAILY FORECAST ===
-def send_daily_forecast():
-    price = get_gold_price()
-    if not price:
-        send_discord_update("⚠️ Gold Price Error", "Could not fetch live gold price.")
-        return
 
-    buy_zone, sell_zone = get_zones(price)
-    ai_sentiment = get_ai_sentiment("Gold market outlook, risk sentiment, and USD strength today.")
-    confidence = calculate_confidence(ai_sentiment)
-
-    description = (
-        f"**Live Gold Price:** ${price}\n"
-        f"**AI Sentiment:** {ai_sentiment}\n"
-        f"**Confidence:** {confidence}%\n\n"
-        f"💰 **Buy Zone:** {buy_zone[0]} – {buy_zone[1]}\n"
-        f"📈 **Sell Zone:** {sell_zone[0]} – {sell_zone[1]}"
-    )
-
-    send_discord_update("🏆 Daily Gold Forecast", description)
-
-# === 7. LIVE MONITOR (Every 5 minutes) ===
-def monitor_gold():
-    print("🔁 Monitoring gold price for trade opportunities...")
-    last_signal = None
-
-    while True:
-        price = get_gold_price()
-        if price:
-            buy_zone, sell_zone = get_zones(price)
-            ai_sentiment = get_ai_sentiment("Gold market movement and manipulation probability.")
-            confidence = calculate_confidence(ai_sentiment)
-
-            if confidence >= 80:
-                if buy_zone[0] <= price <= buy_zone[1]:
-                    if last_signal != "buy":
-                        send_discord_update(
-                            "🟢 Gold Entered BUY Zone",
-                            f"Price: ${price}\nAI Confidence: {confidence}%\nSentiment: {ai_sentiment}\nSuggested Action: **Consider Long Entries**",
-                            color=0x00FF00
-                        )
-                        last_signal = "buy"
-                elif sell_zone[0] <= price <= sell_zone[1]:
-                    if last_signal != "sell":
-                        send_discord_update(
-                            "🔴 Gold Entered SELL Zone",
-                            f"Price: ${price}\nAI Confidence: {confidence}%\nSentiment: {ai_sentiment}\nSuggested Action: **Consider Short Entries**",
-                            color=0xFF0000
-                        )
-                        last_signal = "sell"
-        time.sleep(300)  # check every 5 minutes
-
-# === 8. SCHEDULER ===
+# === SCHEDULER ===
 def run_scheduler():
-    print("🚀 Gold Forecast AI Bot is live...")
+    print("🚀 Gold AI Bot running — awaiting 8 AM Pakistan Time...")
     while True:
         now = datetime.now(TIMEZONE)
-        if now.hour == SEND_HOUR and now.minute == 0:
-            send_daily_forecast()
+        target = now.replace(hour=SEND_HOUR, minute=0, second=0, microsecond=0)
+
+        if target <= now < target + timedelta(minutes=1):
+            send_discord_update()
             time.sleep(60)
-        else:
-            time.sleep(20)
+        time.sleep(30)
+
 
 # === MAIN ===
 if __name__ == "__main__":
-    send_daily_forecast()  # Send immediately when deployed
-    from threading import Thread
-    Thread(target=monitor_gold).start()  # Start background monitoring
+    send_discord_update()  # send immediately when started
     run_scheduler()
