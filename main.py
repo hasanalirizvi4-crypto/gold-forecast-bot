@@ -1,123 +1,83 @@
+import os
 import requests
-import datetime
+from discord import SyncWebhook, Embed
+from datetime import datetime, timedelta
 import pytz
 import time
-import traceback
-from discord import SyncWebhook, Embed
 
-# === Discord Webhook ===
-WEBHOOK_URL = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
-webhook = SyncWebhook.from_url(WEBHOOK_URL)
+# =============== CONFIGURATION ===============
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Make sure you added this in Render environment variables
+TIMEZONE = pytz.timezone("Asia/Karachi")
+SEND_HOUR = 8  # Send at 8 AM
+# =============================================
 
-# === Helper to send embedded messages ===
-def send_embed(title, description, color=0xFFD700, fields=None):
-    embed = Embed(title=title, description=description, color=color, timestamp=datetime.datetime.utcnow())
-    if fields:
-        for field in fields:
-            embed.add_field(name=field["name"], value=field["value"], inline=field.get("inline", False))
-    embed.set_footer(text="Gold Forecast Bot • Auto Analysis")
-    webhook.send(embed=embed)
-
-# === Get real-time gold price (XAU/USD) ===
 def get_gold_price():
+    """Fetch the latest gold price from a free public API."""
     try:
-        url = "https://api.metals.live/v1/spot/gold"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0 and "price" in data[-1]:
-            return float(data[-1]["price"])
-    except Exception:
+        url = "https://api.metals.live/v1/spot"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        for item in data:
+            if "gold" in item:
+                return float(item["gold"])
         return None
-    return None
-
-# === Generate main daily forecast ===
-def generate_daily_report():
-    try:
-        price = get_gold_price()
-        if not price:
-            send_embed("⚠️ Gold Report Error", "Could not fetch gold price.")
-            return
-
-        # --- Basic calculated levels (adjust logic later) ---
-        buy_zone_low = price - 8
-        buy_zone_high = price - 4
-        sell_zone_low = price + 4
-        sell_zone_high = price + 8
-
-        buy_zone = f"{buy_zone_low:.2f} – {buy_zone_high:.2f}"
-        sell_zone = f"{sell_zone_low:.2f} – {sell_zone_high:.2f}"
-
-        sentiment = "Bullish" if price % 2 == 0 else "Bearish"
-
-        fields = [
-            {"name": "Current Price", "value": f"${price}", "inline": True},
-            {"name": "Buy Zone", "value": buy_zone, "inline": True},
-            {"name": "Sell Zone", "value": sell_zone, "inline": True},
-            {"name": "Market Sentiment", "value": sentiment, "inline": False},
-            {"name": "Comment", "value": f"Gold appears {sentiment.lower()} — consider trades near respective zones."}
-        ]
-        send_embed("📊 Daily Gold Report", "Automated forecast for XAU/USD.", fields=fields)
-        return (buy_zone_low, buy_zone_high, sell_zone_low, sell_zone_high)
-
     except Exception as e:
-        send_embed("⚠️ Error in Daily Report", f"```\n{traceback.format_exc()}\n```", color=0xFF0000)
+        print("Error fetching gold price:", e)
         return None
 
-# === Check live price every minute ===
-def monitor_price(zones):
-    buy_low, buy_high, sell_low, sell_high = zones
-    while True:
-        try:
-            price = get_gold_price()
-            if not price:
-                time.sleep(60)
-                continue
+def get_sentiment():
+    """Example placeholder sentiment logic."""
+    try:
+        # You can replace this with real sentiment data later
+        return {
+            "Overall Sentiment": "Bullish",
+            "Market Confidence": "Strong",
+            "Technical Bias": "Uptrend"
+        }
+    except Exception as e:
+        print("Error fetching sentiment:", e)
+        return None
 
-            # Check for buy zone re-entry
-            if buy_low <= price <= buy_high:
-                send_embed(
-                    "💰 Gold Buy Zone Alert",
-                    f"Price re-entered buy zone at **${price:.2f}**.\nConsider long entries.",
-                    color=0x32CD32
-                )
-
-            # Check for sell zone re-entry
-            elif sell_low <= price <= sell_high:
-                send_embed(
-                    "📉 Gold Sell Zone Alert",
-                    f"Price re-entered sell zone at **${price:.2f}**.\nConsider short entries.",
-                    color=0xFF6347
-                )
-
-            time.sleep(60)  # check every 1 min
-        except Exception:
-            time.sleep(60)
-
-# === Daily scheduling ===
-def schedule_daily_task():
-    pk_tz = pytz.timezone("Asia/Karachi")
-    while True:
-        now = datetime.datetime.now(pk_tz)
-        target = now.replace(hour=8, minute=0, second=0, microsecond=0)
-        if now > target:
-            target += datetime.timedelta(days=1)
-        sleep_time = (target - now).total_seconds()
-        time.sleep(sleep_time)
-
-        zones = generate_daily_report()
-        if zones:
-            monitor_price(zones)
-
-# === On startup ===
-def startup_message():
-    send_embed(
-        "✅ Gold Forecast Bot Active",
-        "Bot successfully deployed on Render.\n\nDaily report scheduled for **8 AM Pakistan Time**.\nIt will also alert whenever gold re-enters key buy/sell zones.",
-        color=0x1E90FF
+def send_discord_update():
+    """Send a nicely formatted message to the Discord webhook."""
+    webhook = SyncWebhook.from_url(WEBHOOK_URL)
+    embed = Embed(
+        title="📈 Daily Gold Forecast Update",
+        description=f"Here’s your morning update for gold price and market sentiment.",
+        color=0xFFD700,
+        timestamp=datetime.now(TIMEZONE)
     )
 
-# === Main ===
+    gold_price = get_gold_price()
+    sentiment_details = get_sentiment()
+
+    if gold_price:
+        embed.add_field(name="🏅 Gold Price (USD/oz)", value=f"${gold_price:,}", inline=False)
+    else:
+        embed.add_field(name="🏅 Gold Price (USD/oz)", value="⚠️ Could not fetch gold price", inline=False)
+
+    if sentiment_details:
+        sentiment_text = "\n".join([f"**{k}:** {v}" for k, v in sentiment_details.items()])
+        embed.add_field(name="📊 Market Sentiment", value=sentiment_text, inline=False)
+    else:
+        embed.add_field(name="📊 Market Sentiment", value="⚠️ Could not fetch sentiment data", inline=False)
+
+    embed.set_footer(text="Auto Gold Forecast Bot • Powered by Hasan Ali")
+    webhook.send(embed=embed)
+    print(f"✅ Update sent successfully at {datetime.now(TIMEZONE)}")
+
+def run_scheduler():
+    """Run loop to send the message at 8 AM daily."""
+    print("🚀 Gold Forecast Bot is running...")
+    while True:
+        now = datetime.now(TIMEZONE)
+        target_time = now.replace(hour=SEND_HOUR, minute=0, second=0, microsecond=0)
+
+        if now >= target_time and now < target_time + timedelta(minutes=1):
+            send_discord_update()
+            time.sleep(60)  # Wait a minute to prevent duplicate sends
+        time.sleep(30)
+
 if __name__ == "__main__":
-    startup_message()
-    generate_daily_report()  # optional immediate report on start
-    schedule_daily_task()
+    send_discord_update()  # Send immediately when starting (optional)
+    run_scheduler()
