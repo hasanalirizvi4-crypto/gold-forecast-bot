@@ -1,6 +1,4 @@
+flask
 requests
-discord-webhook
-transformers
-torch
-sentencepiece
-accelerate
+numpy
+scikit-learn
