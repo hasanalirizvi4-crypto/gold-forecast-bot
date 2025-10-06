@@ -2,15 +2,16 @@ import os
 import time
 import logging
 import requests
-from transformers import pipeline
 from datetime import datetime
+from openai import OpenAI
 
 # -------------------------------
 # CONFIG
 # -------------------------------
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON")
-CHECK_INTERVAL = 300  # seconds
-GOLD_API_KEY = os.getenv("GOLD_API_KEY", "goldapi-akhgqzsmgeyofq0-io")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+GOLD_API_KEY = os.getenv("GOLD_API_KEY")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
+OPENAI_API_KEY = os.getenv("gold_api_bot")
 
 # -------------------------------
 # LOGGING SETUP
@@ -21,11 +22,10 @@ logging.basicConfig(
 )
 
 # -------------------------------
-# LOCAL AI SENTIMENT MODEL
+# OPENAI CLIENT
 # -------------------------------
-logging.info("🚀 Loading local AI model (no Hugging Face token required)...")
-analyzer = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-logging.info("✅ AI model loaded successfully!")
+client = OpenAI(api_key=OPENAI_API_KEY)
+logging.info("✅ OpenAI client initialized successfully.")
 
 # -------------------------------
 # FETCH GOLD PRICE (MULTI-API)
@@ -54,7 +54,6 @@ def fetch_gold_price():
             response = requests.get(src["url"], headers=src["headers"], timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                # Parse based on API format
                 if src["key"]:
                     keys = src["key"].split(".")
                     for k in keys:
@@ -62,7 +61,6 @@ def fetch_gold_price():
                     if data:
                         return float(data)
                 else:
-                    # metals.live returns a list like [{"metal":"gold","price":2345.67},...]
                     if isinstance(data, list) and len(data) > 0 and "gold" in str(data[0]).lower():
                         return float(data[0].get("price", 0))
         except Exception as e:
@@ -76,11 +74,16 @@ def fetch_gold_price():
 # -------------------------------
 def analyze_market_news(news_text):
     try:
-        result = analyzer(news_text[:512])[0]
-        sentiment = result["label"]
-        score = result["score"]
-        logging.info(f"🧠 AI Sentiment: {sentiment} ({score:.2f})")
-        return sentiment, score
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a financial sentiment analyst. Respond only with Positive, Negative, or Neutral."},
+                {"role": "user", "content": news_text}
+            ]
+        )
+        sentiment = response.choices[0].message.content.strip().upper()
+        logging.info(f"🧠 AI Sentiment: {sentiment}")
+        return sentiment, 1.0
     except Exception as e:
         logging.error(f"AI Analysis failed: {e}")
         return "NEUTRAL", 0.0
@@ -100,17 +103,16 @@ def send_discord_alert(message):
         logging.warning(f"⚠️ Could not send Discord alert: {e}")
 
 # -------------------------------
-# MAIN BOT LOOP
+# MAIN LOOP
 # -------------------------------
 def main():
-    logging.info("🌟 Gold AI Bot Pro (Offline AI Version) Started 🌟")
+    logging.info("🌟 Gold AI Bot Pro (OpenAI Version) Started 🌟")
 
     while True:
         price = fetch_gold_price()
         if price:
             sentiment, score = analyze_market_news(f"Gold price is currently {price}. Market reacting with uncertainty.")
-            
-            msg = f"💰 Gold Price: **${price:.2f}**\n🧠 Sentiment: **{sentiment} ({score:.2f})**\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            msg = f"💰 Gold Price: **${price:.2f}**\n🧠 Sentiment: **{sentiment}**\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             send_discord_alert(msg)
             logging.info(msg)
         else:
@@ -118,8 +120,5 @@ def main():
         
         time.sleep(CHECK_INTERVAL)
 
-# -------------------------------
-# RUN
-# -------------------------------
 if __name__ == "__main__":
     main()
