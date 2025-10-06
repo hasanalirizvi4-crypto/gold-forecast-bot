@@ -8,7 +8,7 @@ from sklearn.ensemble import RandomForestRegressor
 # ==============================================
 # CONFIGURATION
 # ==============================================
-HF_TOKEN = "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"
+HF_TOKEN = "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"
 DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
 
 # ==============================================
