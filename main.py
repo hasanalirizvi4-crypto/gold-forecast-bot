@@ -1,148 +1,125 @@
 import os
 import time
-import json
-import requests
 import logging
-from datetime import datetime
+import requests
 from transformers import pipeline
+from datetime import datetime
 
-# ───────────────────────────────
-# CONFIGURATION
-# ───────────────────────────────
+# -------------------------------
+# CONFIG
+# -------------------------------
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON")
-HF_TOKEN = os.getenv("HF_TOKEN", "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")
-GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "goldapi-akhgqzsmgeyofq0-io")
+CHECK_INTERVAL = 300  # seconds
+GOLD_API_KEY = os.getenv("GOLD_API_KEY", "goldapi-akhgqzsmgeyofq0-io")
 
-DATA_FILE = "price_history.json"  # stores learning data
+# -------------------------------
+# LOGGING SETUP
+# -------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logging.info("🚀 Starting Gold AI Bot v4 (Self-Learning AI)")
+# -------------------------------
+# LOCAL AI SENTIMENT MODEL
+# -------------------------------
+logging.info("🚀 Loading local AI model (no Hugging Face token required)...")
+analyzer = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+logging.info("✅ AI model loaded successfully!")
 
-# ───────────────────────────────
-# LOAD OR INITIALIZE PRICE HISTORY
-# ───────────────────────────────
-def load_history():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-def save_history(history):
-    with open(DATA_FILE, "w") as f:
-        json.dump(history, f, indent=4)
-
-# ───────────────────────────────
-# AI MODEL SETUP
-# ───────────────────────────────
-try:
-    ai_analyzer = pipeline(
-        "text-generation",
-        model="facebook/opt-1.3b",
-        use_auth_token=HF_TOKEN
-    )
-    logging.info("✅ Hugging Face AI model loaded successfully.")
-except Exception as e:
-    ai_analyzer = None
-    logging.warning(f"⚠️ Could not load AI model: {e}")
-
-# ───────────────────────────────
-# FETCH GOLD PRICE
-# ───────────────────────────────
+# -------------------------------
+# FETCH GOLD PRICE (MULTI-API)
+# -------------------------------
 def fetch_gold_price():
-    urls = [
-        "https://www.goldapi.io/api/XAU/USD",
-        "https://api.exchangerate.host/convert?from=XAU&to=USD"
+    sources = [
+        {
+            "url": "https://www.goldapi.io/api/XAU/USD",
+            "headers": {"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"},
+            "key": "price"
+        },
+        {
+            "url": "https://api.metals.dev/v1/latest",
+            "headers": {"accept": "application/json"},
+            "key": "metals.gold"
+        },
+        {
+            "url": "https://api.metals.live/v1/spot",
+            "headers": {},
+            "key": None
+        },
     ]
-    headers = {"x-access-token": GOLDAPI_KEY, "Content-Type": "application/json"}
-
-    for url in urls:
+    
+    for src in sources:
         try:
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-
-            if "price" in data:
-                return float(data["price"])
-            if "result" in data:
-                return float(data["result"])
-
+            response = requests.get(src["url"], headers=src["headers"], timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                # Parse based on API format
+                if src["key"]:
+                    keys = src["key"].split(".")
+                    for k in keys:
+                        data = data.get(k) if isinstance(data, dict) else None
+                    if data:
+                        return float(data)
+                else:
+                    # metals.live returns a list like [{"metal":"gold","price":2345.67},...]
+                    if isinstance(data, list) and len(data) > 0 and "gold" in str(data[0]).lower():
+                        return float(data[0].get("price", 0))
         except Exception as e:
-            logging.warning(f"Failed {url}: {e}")
+            logging.warning(f"Failed {src['url']}: {e}")
 
     logging.warning("⚠️ Could not fetch gold price from any source.")
     return None
 
-# ───────────────────────────────
-# AI ANALYSIS FUNCTION
-# ───────────────────────────────
-def ai_analyze(price, history):
-    if not ai_analyzer:
-        return "AI model unavailable. Check Hugging Face connection."
-
-    # build summary of last few prices
-    last_points = [f"${round(p['price'], 2)}" for p in history[-5:]]
-    context = ", ".join(last_points) if last_points else "no previous data"
-
-    prompt = (
-        f"Previous gold prices were {context}. "
-        f"The current price is ${price:.2f}. "
-        f"Analyze the trend, predict the next move, and give a short strategy summary."
-    )
-
+# -------------------------------
+# AI SENTIMENT ANALYSIS
+# -------------------------------
+def analyze_market_news(news_text):
     try:
-        result = ai_analyzer(prompt, max_length=120, num_return_sequences=1)
-        return result[0]["generated_text"]
+        result = analyzer(news_text[:512])[0]
+        sentiment = result["label"]
+        score = result["score"]
+        logging.info(f"🧠 AI Sentiment: {sentiment} ({score:.2f})")
+        return sentiment, score
     except Exception as e:
-        return f"AI analysis failed: {e}"
+        logging.error(f"AI Analysis failed: {e}")
+        return "NEUTRAL", 0.0
 
-# ───────────────────────────────
-# DISCORD ALERT FUNCTION
-# ───────────────────────────────
-def send_discord_message(message):
-    if not DISCORD_WEBHOOK:
-        logging.warning("⚠️ Discord webhook not configured; skipping send.")
-        return
+# -------------------------------
+# DISCORD ALERT
+# -------------------------------
+def send_discord_alert(message):
     try:
-        requests.post(DISCORD_WEBHOOK, json={"content": message})
-        logging.info("✅ Sent message to Discord.")
+        data = {"content": message}
+        response = requests.post(DISCORD_WEBHOOK, json=data)
+        if response.status_code == 204:
+            logging.info("✅ Discord alert sent successfully.")
+        else:
+            logging.warning(f"⚠️ Discord alert failed: {response.text}")
     except Exception as e:
-        logging.warning(f"Failed to send Discord message: {e}")
+        logging.warning(f"⚠️ Could not send Discord alert: {e}")
 
-# ───────────────────────────────
+# -------------------------------
 # MAIN BOT LOOP
-# ───────────────────────────────
+# -------------------------------
 def main():
-    history = load_history()
+    logging.info("🌟 Gold AI Bot Pro (Offline AI Version) Started 🌟")
 
     while True:
         price = fetch_gold_price()
-        if price is None:
-            logging.error("❌ Could not retrieve gold price.")
+        if price:
+            sentiment, score = analyze_market_news(f"Gold price is currently {price}. Market reacting with uncertainty.")
+            
+            msg = f"💰 Gold Price: **${price:.2f}**\n🧠 Sentiment: **{sentiment} ({score:.2f})**\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            send_discord_alert(msg)
+            logging.info(msg)
         else:
-            logging.info(f"💰 Current Gold Price: ${price:.2f}")
+            logging.warning("⚠️ Could not retrieve gold price.")
+        
+        time.sleep(CHECK_INTERVAL)
 
-            history.append({"time": datetime.now().isoformat(), "price": price})
-            if len(history) > 100:
-                history = history[-100:]  # keep last 100 records
-            save_history(history)
-
-            analysis = ai_analyze(price, history)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            message = (
-                f"**Gold Price Update ({timestamp})**\n"
-                f"💰 **Current Price:** ${price:.2f}\n"
-                f"📈 **Last 5 Prices:** {[round(p['price'],2) for p in history[-5:]]}\n"
-                f"🧠 **AI Market Insight:** {analysis}"
-            )
-
-            logging.info(message)
-            send_discord_message(message)
-
-        logging.info("⏳ Waiting 1 hour for next update...\n")
-        time.sleep(3600)  # fetch every hour
-
-
+# -------------------------------
+# RUN
+# -------------------------------
 if __name__ == "__main__":
     main()
