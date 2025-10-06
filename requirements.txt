@@ -1,8 +1,6 @@
-requests
+requests>=2.28.0
 pandas
 numpy
 scikit-learn
 joblib
-transformers   # optional, only if you want local sentiment model
-torch          # if using transformers locally
-
+torch
