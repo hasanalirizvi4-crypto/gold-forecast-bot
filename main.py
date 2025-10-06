@@ -35,27 +35,20 @@ logging.basicConfig(
 # FETCH GOLD PRICE
 # -----------------------------
 def fetch_gold_price():
-    """Fetch gold price from multiple APIs for reliability."""
     urls = [
-        "https://api.metals.live/v1/spot",
-        "https://api.goldapi.io/api/XAU/USD",
-        "https://data-asg.goldprice.org/dbXRates/USD"
+        "https://api.exchangerate.host/convert?from=XAU&to=USD",
     ]
-    headers = {"x-access-token": HF_TOKEN}
     for url in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list):
-                    return float(data[0]["gold"])
-                elif "price" in data:
-                    return float(data["price"])
-                elif "items" in data:
-                    return float(data["items"][0]["xauPrice"])
+            response = requests.get(url, timeout=10)
+            data = response.json()
+            if "result" in data and data["result"]:
+                return float(data["result"])
         except Exception as e:
             logging.warning(f"Failed {url}: {e}")
+    logging.warning("⚠️ Could not fetch gold price from any source.")
     return None
+
 
 # -----------------------------
 # DISCORD MESSAGE HANDLER
