@@ -4,14 +4,19 @@ import logging
 import requests
 from datetime import datetime
 from openai import OpenAI
+from dotenv import load_dotenv
 
 # -------------------------------
-# CONFIG
+# LOAD ENVIRONMENT VARIABLES
 # -------------------------------
+load_dotenv()
+
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
-GOLD_API_KEY = os.getenv("GOLD_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
-OPENAI_API_KEY = os.getenv("gold_api_bot")
+
+# Hardcoded Gold API key
+GOLD_API_KEY = "goldapi-q738vsmgf1dlc3-io"
 
 # -------------------------------
 # LOGGING SETUP
@@ -28,7 +33,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 logging.info("✅ OpenAI client initialized successfully.")
 
 # -------------------------------
-# FETCH GOLD PRICE (MULTI-API)
+# FETCH GOLD PRICE
 # -------------------------------
 def fetch_gold_price():
     sources = [
