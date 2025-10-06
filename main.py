@@ -24,7 +24,7 @@ from discord import SyncWebhook, Embed
 DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
 
 # Your Hugging Face token (embedded as requested)
-HF_TOKEN = "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"
+HF_TOKEN = "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"
 
 # Timezone and schedule
 TIMEZONE = pytz.timezone("Asia/Karachi")
