@@ -4,5 +4,7 @@ pytz==2024.1
 beautifulsoup4==4.12.2
 huggingface-hub==0.24.6
 transformers==4.43.3
-torch==2.5.1
+torch>=2.5.0
 sentencepiece==0.1.99
+--extra-index-url https://download.pytorch.org/whl/cpu
+
