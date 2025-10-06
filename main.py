@@ -12,7 +12,7 @@ from discord_webhook import DiscordWebhook, DiscordEmbed
 # ==============================
 # CONFIG
 # ==============================
-HF_TOKEN = os.getenv("HF_TOKEN", "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")
+HF_TOKEN = os.getenv("HF_TOKEN", "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")
 WEBHOOK_URL = os.getenv(
     "DISCORD_WEBHOOK",
     "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
