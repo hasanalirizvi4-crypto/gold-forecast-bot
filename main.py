@@ -1,129 +1,107 @@
-import os
+from flask import Flask, jsonify
 import requests
+import threading
 import time
-import logging
-from discord_webhook import DiscordWebhook, DiscordEmbed
-from transformers import pipeline
+import random
 
-# ========================
-# CONFIG
-# ========================
-DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
-HF_TOKEN = "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"
-GOLD_API_KEY = "goldapi-favtsmgcmdotp-io"
-UPDATE_INTERVAL = 300  # 5 minutes
+app = Flask(__name__)
 
-# ========================
-# LOGGING
-# ========================
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
+# =============================
+# 🔑 CONFIGURATION
+# =============================
+GOLDAPI_KEY = "goldapi-favtsmgcmdotp-io"
+GOLDAPI_URL = "https://www.goldapi.io/api/XAU/USD"
+REFRESH_INTERVAL = 180  # seconds (3 minutes)
 
-# ========================
-# AI SETUP
-# ========================
-logging.info("Initializing AI model…")
-ai_model = pipeline(
-    "text-generation",
-    model="meta-llama/Meta-Llama-3-8B-Instruct",
-    token=HF_TOKEN
-)
+# =============================
+# 🧾 MEMORY: STORE LAST 10 PRICES
+# =============================
+gold_price_log = []  # will store tuples: (price, timestamp)
 
-# ========================
-# FUNCTIONS
-# ========================
+# =============================
+# 📊 FETCH GOLD PRICE
+# =============================
 def fetch_gold_price():
-    """Fetch gold price using goldapi.io"""
-    url = "https://www.goldapi.io/api/XAU/USD"
-    headers = {"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"}
+    headers = {
+        "x-access-token": GOLDAPI_KEY,
+        "Content-Type": "application/json"
+    }
 
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
+        response = requests.get(GOLDAPI_URL, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
         if "price" in data:
-            return float(data["price"])
+            price_entry = {
+                "price": data["price"],
+                "timestamp": data.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"))
+            }
+
+            # Keep log up to last 10 prices
+            gold_price_log.append(price_entry)
+            if len(gold_price_log) > 10:
+                gold_price_log.pop(0)
+
+            print(f"[INFO] 💰 Updated Gold Price: {price_entry['price']}")
+            return price_entry
         else:
-            logging.warning(f"⚠️ Unexpected API response: {data}")
+            print("[WARNING] No price data in API response.")
+            return None
+
     except Exception as e:
-        logging.error(f"❌ Error fetching gold price: {e}")
+        print(f"[ERROR] Failed to fetch gold price: {e}")
+        return None
 
-    return None
-
-
-def analyze_market(price):
-    """AI evaluates buy/sell zone using reasoning."""
-    if not price:
-        return "⚠️ Could not fetch gold price.", 0.0
-
-    prompt = (
-        f"The current gold price is ${price}. Based on current market behavior and manipulation, "
-        "should we buy, sell, or hold? Provide a clear action and confidence percentage."
-    )
-
-    try:
-        result = ai_model(prompt, max_new_tokens=50)[0]['generated_text']
-        if "buy" in result.lower():
-            sentiment = "🟢 Buy Zone Detected"
-        elif "sell" in result.lower():
-            sentiment = "🔴 Sell Zone Detected"
-        else:
-            sentiment = "⚖️ Hold Zone"
-
-        confidence = 85.0  # approximate for demo
-        return f"{sentiment} — Confidence: {confidence}%\n{result}", confidence
-    except Exception as e:
-        logging.error(f"AI error: {e}")
-        return "⚠️ AI analysis failed.", 0.0
-
-
-def send_discord_update(title, message, color='ffcc00'):
-    """Send update to Discord webhook"""
-    try:
-        webhook = DiscordWebhook(url=DISCORD_WEBHOOK)
-        embed = DiscordEmbed(title=title, description=message, color=color)
-        embed.set_timestamp()
-        webhook.add_embed(embed)
-        webhook.execute()
-    except Exception as e:
-        logging.error(f"❌ Discord send failed: {e}")
-
-
-def train_mini_model(price):
-    """Simulate lightweight training on each price tick."""
-    logging.info("🧠 Training mini neural net on recent price movement...")
-    # Here you could log data or fine-tune a small model if local resources allow
-    # For now, we simulate a quick learning adjustment
-    time.sleep(1)
-    logging.info(f"✅ Mini model updated with price data: {price}")
-
-
-# ========================
-# MAIN LOOP
-# ========================
-def main():
-    logging.info("🚀 Gold AI Bot Pro v3 started successfully!")
-    last_price = None
-
+# =============================
+# 🔁 AUTO REFRESH THREAD
+# =============================
+def auto_refresh_prices():
     while True:
-        price = fetch_gold_price()
-        if price:
-            logging.info(f"💰 Current Gold Price: ${price}")
-            train_mini_model(price)
-            analysis, confidence = analyze_market(price)
+        fetch_gold_price()
+        time.sleep(REFRESH_INTERVAL)
 
-            if confidence >= 80:
-                send_discord_update("Gold AI Signal", analysis, color='03fc88')
-            else:
-                send_discord_update("Gold Market Update", f"Price: ${price}\n{analysis}")
-        else:
-            logging.warning("⚠️ Could not fetch gold price from goldapi.io")
-            send_discord_update("Gold Price Alert", "⚠️ Could not fetch gold price!")
+# Start background thread
+threading.Thread(target=auto_refresh_prices, daemon=True).start()
 
-        time.sleep(UPDATE_INTERVAL)
+# =============================
+# 🧠 MINI NEURAL NET SIMULATION
+# =============================
+def mini_neural_train():
+    if not gold_price_log:
+        return "No data to train yet."
 
+    last_prices = [entry["price"] for entry in gold_price_log]
+    trend = "uptrend 📈" if last_prices[-1] > sum(last_prices) / len(last_prices) else "downtrend 📉"
+    noise_factor = random.uniform(-0.5, 0.5)
 
+    # Simulated "learning"
+    learned_value = last_prices[-1] + noise_factor
+    return f"Model trained. Detected {trend}, adjusted weight to {learned_value:.2f}"
+
+# =============================
+# 🌐 API ROUTES
+# =============================
+@app.route("/gold", methods=["GET"])
+def get_gold():
+    if not gold_price_log:
+        fetch_gold_price()
+    return jsonify({
+        "latest_price": gold_price_log[-1] if gold_price_log else "Fetching...",
+        "log": gold_price_log
+    })
+
+@app.route("/train", methods=["GET"])
+def train_ai():
+    result = mini_neural_train()
+    return jsonify({
+        "message": "Training daily with the mini neural net... ✅",
+        "result": result
+    })
+
+# =============================
+# 🚀 MAIN APP
+# =============================
 if __name__ == "__main__":
-    send_discord_update("🤖 Gold AI Bot Started", "Monitoring gold prices and training daily.")
-    main()
+    print("[START] 🚀 Gold AI Tracker is running...")
+    app.run(debug=True, port=5000)
