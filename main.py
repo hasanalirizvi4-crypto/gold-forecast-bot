@@ -14,16 +14,26 @@ TIMEZONE = pytz.timezone("Asia/Karachi")
 
 # ====== FUNCTIONS ======
 
-# --- Gold price fetcher with retry ---
 def get_gold_price():
-    for _ in range(3):  # Try up to 3 times
+    urls = [
+        "https://api.metals.live/v1/spot",
+        "https://data-asg.goldprice.org/dbXRates/USD"
+    ]
+    for url in urls:
         try:
-            response = requests.get("https://data-asg.goldprice.org/dbXRates/USD", timeout=5)
+            response = requests.get(url, timeout=10)
             data = response.json()
-            return float(data["items"][0]["xauPrice"])
-        except Exception:
+            # Handle metals.live
+            if isinstance(data, list) and isinstance(data[0], dict) and "gold" in data[0]:
+                return float(data[0]["gold"])
+            # Handle goldprice.org
+            if isinstance(data, dict) and "items" in data:
+                return float(data["items"][0]["xauPrice"])
+        except Exception as e:
+            print(f"Error fetching gold price from {url}: {e}")
             time.sleep(2)
     return None
+
 
 # --- Sentiment Analysis (using ForexFactory calendar sentiment) ---
 def get_sentiment():
