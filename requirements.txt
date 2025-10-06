@@ -4,5 +4,5 @@ pytz==2024.1
 beautifulsoup4==4.12.2
 huggingface-hub==0.24.6
 transformers==4.43.3
-torch==2.2.2
+torch==2.5.1
 sentencepiece==0.1.99
