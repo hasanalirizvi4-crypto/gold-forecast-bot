@@ -29,7 +29,8 @@ logging.basicConfig(
 # -------------------------------
 # OPENAI CLIENT
 # -------------------------------
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key="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")
+
 logging.info("✅ OpenAI client initialized successfully.")
 
 # -------------------------------
