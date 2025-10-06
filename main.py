@@ -1,13 +1,12 @@
 import sys, types
+if 'audioop' not in sys.modules:
+    sys.modules['audioop'] = types.ModuleType('audioop')
+
 import time
 import requests
 from datetime import datetime
 import pytz
 from discord import SyncWebhook, Embed
-
-# 🩹 Patch for Python 3.13 — fixes missing audioop issue
-if 'audioop' not in sys.modules:
-    sys.modules['audioop'] = types.ModuleType('audioop')
 
 # ====== CONFIGURATION ======
 WEBHOOK_URL = "https://discordapp.com/api/webhooks/1424147591423070302/pP23bHlUs7rEzLVD_0T7kAbrZB8n9rfh-mWsW_S0WXRGpCM8oypCUl0Alg9642onMYON"
