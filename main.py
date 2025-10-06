@@ -17,7 +17,8 @@ import csv
 import pandas as pd
 import numpy as np
 
-from discord import SyncWebhook, Embed
+from discord_webhook import DiscordWebhook, DiscordEmbed
+
 
 # ----------------- CONFIG -----------------
 # Your Discord webhook (you asked to include it directly)
