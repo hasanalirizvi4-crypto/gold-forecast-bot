@@ -1,4 +1,8 @@
-openai>=1.51.0
-requests>=2.31.0
-python-dotenv>=1.0.1
+requests
+pandas
+numpy
+scikit-learn
+joblib
+transformers   # optional, only if you want local sentiment model
+torch          # if using transformers locally
 
