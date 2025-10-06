@@ -1,395 +1,397 @@
+#!/usr/bin/env python3
 """
-Gold AI Bot — Self-Learning Edition
-- Multi-API gold price fetcher (fallbacks)
-- Local sentiment analysis (optional)
-- Persistent incremental learning:
-    - SGDRegressor for online updates (fast)
-    - Periodic RandomForest retrain for stronger model
-- Saves price history to CSV and models with joblib
-- Sends Discord alerts via webhook
+Gold AI Bot — Learning v3
+- Fetches gold price hourly (multi-API fallback)
+- Logs data to CSV
+- Uses a tiny PyTorch MLP to predict next return
+- Retrains the MLP once daily in a background thread
+- Persists model + scaler so learning survives restarts
+- Posts price + prediction + confidence to Discord
+
+ENV required:
+  DISCORD_WEBHOOK  - Discord webhook URL
+  GOLD_API_KEY     - (optional) GoldAPI key
+  UPDATE_INTERVAL  - seconds between price fetches (default 3600)
+  DATA_DIR         - directory to store data/models (default "data")
 """
 
 import os
 import time
+import json
 import math
 import logging
+import threading
+from datetime import datetime, timedelta
+
 import requests
-import joblib
-import pandas as pd
 import numpy as np
-from datetime import datetime
-from sklearn.linear_model import SGDRegressor
-from sklearn.ensemble import RandomForestRegressor
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
+import joblib
 
-# OPTIONAL: local transformer for sentiment (no HF token required)
-try:
-    from transformers import pipeline
-    HAS_TRANSFORMERS = True
-except Exception:
-    HAS_TRANSFORMERS = False
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 
 # -------------------------
-# CONFIG (use env vars)
+# CONFIG (environment)
 # -------------------------
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")  # set in Render
-GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # optional, e.g. goldapi-...
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "300"))  # seconds between fetches
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")  # optional
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", str(3600)))  # default hourly
 DATA_DIR = os.getenv("DATA_DIR", "data")
 HISTORY_CSV = os.path.join(DATA_DIR, "price_history.csv")
-SGD_MODEL_FILE = os.path.join(DATA_DIR, "sgd_model.joblib")
-RF_MODEL_FILE = os.path.join(DATA_DIR, "rf_model.joblib")
+MODEL_FILE = os.path.join(DATA_DIR, "nn_model.pt")
 SCALER_FILE = os.path.join(DATA_DIR, "scaler.joblib")
+LAST_RETRAIN_FILE = os.path.join(DATA_DIR, "last_retrain.json")
 
-# Training params
-LAG = int(os.getenv("LAG", "10"))  # number of lagged prices used as features
-MIN_TRAIN_SAMPLES = int(os.getenv("MIN_TRAIN_SAMPLES", "200"))
-RF_RETRAIN_BATCH = int(os.getenv("RF_RETRAIN_BATCH", "500"))  # perform RF retrain after this many new samples
+# Model / training hyperparams (small)
+LAG = int(os.getenv("LAG", "12"))           # number of lagged prices used as features
 SMA_PERIOD = int(os.getenv("SMA_PERIOD", "5"))
+MIN_SAMPLES_TO_TRAIN = int(os.getenv("MIN_SAMPLES_TO_TRAIN", "200"))
+RETRAIN_INTERVAL_SECONDS = int(os.getenv("RETRAIN_INTERVAL_SECONDS", str(24*3600)))  # daily
+TRAIN_EPOCHS = int(os.getenv("TRAIN_EPOCHS", "20"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
+LR = float(os.getenv("LEARNING_RATE", "0.001"))
+HIDDEN_UNITS = int(os.getenv("HIDDEN_UNITS", "32"))
+DEVICE = torch.device("cpu")  # keep CPU-only for Render-compatible
 
 # -------------------------
 # Logging
 # -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("gold-learning-bot")
+logger = logging.getLogger("gold-ai-v3")
+logger.info("Starting Gold AI Bot v3 (daily retrain mini-MLP)")
 
-logger.info("Starting Gold AI Bot — self-learning edition")
-logger.info("DISCORD_WEBHOOK present: %s", bool(DISCORD_WEBHOOK))
-logger.info("TRANSFORMERS available: %s", HAS_TRANSFORMERS)
-
-# -------------------------
 # Ensure data dir
-# -------------------------
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -------------------------
-# Load / init sentiment model
-# -------------------------
-sentiment_pipeline = None
-if HAS_TRANSFORMERS:
-    try:
-        # lightweight local sentiment model
-        sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-        logger.info("Loaded local sentiment pipeline")
-    except Exception as e:
-        logger.warning("Failed to load local transformer model: %s", e)
-        sentiment_pipeline = None
-
-# -------------------------
-# Multi-source price fetcher
+# Utilities: fetch multi-API gold price
 # -------------------------
 def fetch_gold_price():
-    # prioritized list of sources (name, url, headers, parser)
+    """Try multiple sources, return USD/oz or None."""
     apis = [
-        ("GoldAPI.io", "https://www.goldapi.io/api/XAU/USD",
-         {"x-access-token": GOLD_API_KEY} if GOLD_API_KEY else {}, lambda d: d.get("price") if isinstance(d, dict) else None),
-        ("GoldPrice.org", "https://data-asg.goldprice.org/dbXRates/USD", {}, lambda d: d.get("items", [{}])[0].get("xauPrice") if isinstance(d, dict) else None),
-        ("Metals.live", "https://api.metals.live/v1/spot/gold", {}, lambda d: float(d[0]["gold"]) if isinstance(d, list) and "gold" in d[0] else None),
-        ("ExchangeRate.host", "https://api.exchangerate.host/convert?from=XAU&to=USD", {}, lambda d: d.get("result") if isinstance(d, dict) else None),
-        ("YahooFutures", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=GC=F", {}, lambda d: d.get("quoteResponse", {}).get("result", [{}])[0].get("regularMarketPrice") if isinstance(d, dict) else None),
-        ("Metals-API-demo", "https://metals-api.com/api/latest?access_key=demo&base=USD&symbols=XAU", {}, lambda d: d.get("rates", {}).get("XAU") if isinstance(d, dict) else None),
+        ("GoldAPI.io", "https://www.goldapi.io/api/XAU/USD", {"x-access-token": GOLD_API_KEY}),
+        ("GoldPrice.org", "https://data-asg.goldprice.org/dbXRates/USD", {}),
+        ("Metals.live", "https://api.metals.live/v1/spot/gold", {}),
+        ("ExchangeRate.host", "https://api.exchangerate.host/convert?from=XAU&to=USD", {}),
+        ("YahooFutures", "https://query1.finance.yahoo.com/v7/finance/quote?symbols=GC=F", {}),
     ]
-
-    for name, url, headers, parser in apis:
+    for name, url, headers in apis:
         try:
-            logger.info("Trying %s", name)
+            logger.debug("Trying %s", name)
             r = requests.get(url, headers=headers or {}, timeout=8)
             if r.status_code != 200:
-                logger.debug("%s returned status %s", name, r.status_code)
+                logger.debug("%s returned %s", name, r.status_code)
                 continue
             data = r.json()
-            price = parser(data)
-            if price is None:
-                logger.debug("%s returned unexpected payload", name)
-                continue
-            price = float(price)
-            if price <= 0 or math.isnan(price):
-                logger.debug("%s returned invalid price: %s", name, price)
-                continue
-            logger.info("Fetched price from %s: %s", name, price)
-            return price
+            # parsers per API
+            if name == "GoldAPI.io" and isinstance(data, dict) and data.get("price"):
+                return float(data["price"])
+            if name == "GoldPrice.org" and isinstance(data, dict):
+                itm = data.get("items", [{}])[0]
+                if itm.get("xauPrice"):
+                    return float(itm["xauPrice"])
+            if name == "Metals.live" and isinstance(data, list):
+                # metals.live returns list of spot prices, sometimes as dicts containing 'gold'
+                first = data[0]
+                if isinstance(first, dict) and "gold" in first:
+                    # older format returns {"gold": 2345.67}
+                    val = first.get("gold")
+                    if val:
+                        return float(val)
+                # some endpoints return {"metal":"gold","price":...}
+                if isinstance(first, dict) and "price" in first:
+                    return float(first["price"])
+            if name == "ExchangeRate.host" and isinstance(data, dict) and "result" in data:
+                return float(data["result"])
+            if name == "YahooFutures" and isinstance(data, dict):
+                q = data.get("quoteResponse", {}).get("result", [{}])[0]
+                if q and q.get("regularMarketPrice"):
+                    return float(q["regularMarketPrice"])
         except Exception as e:
-            logger.warning("Error fetching from %s: %s", name, e)
+            logger.debug("API %s failed: %s", name, e)
             continue
-
-    logger.warning("Could not fetch price from any source")
+    logger.warning("Could not fetch gold price from any source")
     return None
 
 # -------------------------
-# Persistence: CSV functions
+# Persistence: logging prices
 # -------------------------
-def append_price(price: float, timestamp: datetime = None, sentiment_label: str = None, sentiment_score: float = None, predicted: float = None):
-    ts = (timestamp or datetime.utcnow()).isoformat()
+def append_price(price: float, ts: datetime = None):
+    ts = (ts or datetime.utcnow()).isoformat()
     header = not os.path.exists(HISTORY_CSV)
-    row = {"timestamp": ts, "price": float(price), "sentiment": sentiment_label, "sentiment_score": sentiment_score, "predicted": predicted}
-    df = pd.DataFrame([row])
+    df = pd.DataFrame([{"timestamp": ts, "price": float(price)}])
     df.to_csv(HISTORY_CSV, mode="a", header=header, index=False)
 
-def load_history():
+def load_history_df():
     if not os.path.exists(HISTORY_CSV):
-        return pd.DataFrame(columns=["timestamp","price","sentiment","sentiment_score","predicted"])
-    df = pd.read_csv(HISTORY_CSV, parse_dates=["timestamp"])
-    return df
+        return pd.DataFrame(columns=["timestamp","price"])
+    return pd.read_csv(HISTORY_CSV, parse_dates=["timestamp"])
 
 # -------------------------
 # Feature engineering
 # -------------------------
-def build_features(df: pd.DataFrame, lag: int = LAG):
-    """
-    Build features for supervised learning:
-    - lagged normalized prices (lag values normalized to most recent in window)
-    - SMA gap
-    - volatility (std) of window
-    Target: next return ((p_{t+1} / p_t) - 1)
-    """
-    series = df["price"].values
-    n = len(series)
-    X_rows = []
-    y = []
+def build_features_targets(df: pd.DataFrame, lag=LAG):
+    prices = df["price"].values.astype(float)
+    n = len(prices)
     if n < lag + 1:
         return None, None
+    X_list = []
+    y_list = []
     for i in range(lag, n-1):
-        window = series[i-lag:i]
-        current = series[i]
-        nextp = series[i+1]
-        rel_lags = (window / window[-1]) - 1.0  # relative lags
+        window = prices[i-lag:i]  # oldest -> newest
+        current = prices[i]
+        nextp = prices[i+1]
+        # normalized lags relative to last element
+        rel = (window / (window[-1] + 1e-12)) - 1.0
         sma = np.mean(window[-SMA_PERIOD:]) if len(window) >= SMA_PERIOD else np.mean(window)
-        sma_gap = sma / current - 1.0
-        vol = np.std(window) / (current + 1e-9)
-        feats = np.concatenate([rel_lags, [sma_gap, vol]])
-        X_rows.append(feats)
-        y.append((nextp / current) - 1.0)
-    X = np.vstack(X_rows)
-    y = np.array(y)
+        sma_gap = sma / (current + 1e-12) - 1.0
+        vol = np.std(window) / (current + 1e-12)
+        feat = np.concatenate([rel, [sma_gap, vol]])
+        X_list.append(feat)
+        y_list.append((nextp / current) - 1.0)  # predict next return
+    X = np.vstack(X_list)
+    y = np.array(y_list).reshape(-1,1)
     return X, y
 
 # -------------------------
-# Model management
+# Tiny MLP (PyTorch)
 # -------------------------
-sgd_model = None
-scaler = None
-rf_model = None
-samples_since_rf = 0
+class TinyMLP(nn.Module):
+    def __init__(self, input_dim, hidden_units=HIDDEN_UNITS):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_units),
+            nn.ReLU(),
+            nn.Linear(hidden_units, hidden_units//2 if hidden_units>=4 else 1),
+            nn.ReLU(),
+            nn.Linear(max(hidden_units//2,1), 1)
+        )
+    def forward(self, x):
+        return self.net(x)
 
-def load_models():
-    global sgd_model, scaler, rf_model
-    if os.path.exists(SGD_MODEL_FILE):
-        try:
-            sgd_model = joblib.load(SGD_MODEL_FILE)
-            logger.info("Loaded SGD model")
-        except Exception:
-            logger.exception("Failed to load SGD model")
+# -------------------------
+# Load/save model & scaler
+# -------------------------
+def save_scaler_and_model(scaler, model):
+    joblib.dump(scaler, SCALER_FILE)
+    torch.save(model.state_dict(), MODEL_FILE)
+    logger.info("Saved model and scaler")
+
+def load_scaler_and_model(input_dim):
+    scaler = None
+    model = TinyMLP(input_dim).to(DEVICE)
     if os.path.exists(SCALER_FILE):
+        scaler = joblib.load(SCALER_FILE)
+        logger.info("Loaded scaler")
+    if os.path.exists(MODEL_FILE):
         try:
-            scaler = joblib.load(SCALER_FILE)
-            logger.info("Loaded scaler")
-        except Exception:
-            logger.exception("Failed to load scaler")
-    if os.path.exists(RF_MODEL_FILE):
-        try:
-            rf_model = joblib.load(RF_MODEL_FILE)
-            logger.info("Loaded RF model")
-        except Exception:
-            logger.exception("Failed to load RF model")
-
-def save_models():
-    try:
-        if sgd_model is not None:
-            joblib.dump(sgd_model, SGD_MODEL_FILE)
-        if scaler is not None:
-            joblib.dump(scaler, SCALER_FILE)
-        if rf_model is not None:
-            joblib.dump(rf_model, RF_MODEL_FILE)
-    except Exception:
-        logger.exception("Failed to save models")
-
-def initialize_models(feature_dim):
-    global sgd_model, scaler
-    if scaler is None:
-        scaler = StandardScaler()
-    if sgd_model is None:
-        sgd_model = SGDRegressor(max_iter=1000, tol=1e-3)
+            state = torch.load(MODEL_FILE, map_location=DEVICE)
+            model.load_state_dict(state)
+            logger.info("Loaded NN model from disk")
+        except Exception as e:
+            logger.warning("Failed to load NN model: %s", e)
+    return scaler, model
 
 # -------------------------
-# Training and updating
+# Training routine (full retrain)
 # -------------------------
-def train_full():
-    """Full retrain (RandomForest) on whole dataset for stronger model."""
-    global rf_model, samples_since_rf, scaler
-    df = load_history()
-    if df.shape[0] < MIN_TRAIN_SAMPLES:
-        logger.info("Not enough data for full retrain: %d/%d", df.shape[0], MIN_TRAIN_SAMPLES)
-        return
-    X, y = build_features(df, lag=LAG)
-    if X is None:
-        logger.info("Not enough rows after feature build")
-        return
-    initialize_models(X.shape[1])
-    scaler.fit(X)
-    Xs = scaler.transform(X)
-    try:
-        logger.info("Training RandomForest (this may take a bit)...")
-        rf = RandomForestRegressor(n_estimators=150, n_jobs=1, random_state=42)
-        rf.fit(Xs, y)
-        rf_model = rf
-        samples_since_rf = 0
-        joblib.dump(rf_model, RF_MODEL_FILE)
-        joblib.dump(scaler, SCALER_FILE)
-        logger.info("RandomForest retrain done and saved.")
-    except Exception:
-        logger.exception("RandomForest training failed")
+def train_nn_full(X, y, input_dim):
+    logger.info("Starting full NN retrain: samples=%d", X.shape[0])
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    Xt = torch.tensor(Xs, dtype=torch.float32).to(DEVICE)
+    yt = torch.tensor(y, dtype=torch.float32).to(DEVICE)
 
-def online_update():
-    """Quick online update using SGD partial_fit on the most recent batch."""
-    global sgd_model, scaler, samples_since_rf
-    df = load_history()
-    X, y = build_features(df, lag=LAG)
-    if X is None:
-        return
-    initialize_models(X.shape[1])
-    # Fit scaler on X (small online re-fit is acceptable)
+    model = TinyMLP(input_dim).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    loss_fn = nn.MSELoss()
+
+    dataset = TensorDataset(Xt, yt)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    for epoch in range(max(1, TRAIN_EPOCHS)):
+        model.train()
+        epoch_losses = []
+        for xb, yb in loader:
+            pred = model(xb)
+            loss = loss_fn(pred, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(loss.item())
+        logger.info("Epoch %d/%d loss %.6f", epoch+1, TRAIN_EPOCHS, float(np.mean(epoch_losses)))
+    # Save
+    save_scaler_and_model(scaler, model)
+    logger.info("Full retrain finished")
+    return scaler, model
+
+# -------------------------
+# Incremental update (cheap)
+# -------------------------
+def incremental_update(X, y, scaler, model):
+    """Perform a few epochs on latest data (cheap) rather than full retrain."""
     try:
-        scaler.partial_fit(X)
-    except Exception:
-        scaler.fit(X)
-    Xs = scaler.transform(X)
-    # If sgd_model not yet initialized with coefficients, do initial partial_fit
-    try:
-        if getattr(sgd_model, "coef_", None) is None:
-            sgd_model.partial_fit(Xs, y)
+        if scaler is None:
+            scaler = StandardScaler()
+            scaler.fit(X)
         else:
-            sgd_model.partial_fit(Xs, y)
-        samples_since_rf += len(y)
-        joblib.dump(sgd_model, SGD_MODEL_FILE)
-        joblib.dump(scaler, SCALER_FILE)
-        logger.info("SGD online update done. Samples pending RF retrain: %d", samples_since_rf)
+            # update scaler on X (fit on full X may be better periodically)
+            scaler.partial_fit(X) if hasattr(scaler, "partial_fit") else scaler.fit(X)
+        Xs = scaler.transform(X)
+        Xt = torch.tensor(Xs, dtype=torch.float32).to(DEVICE)
+        yt = torch.tensor(y, dtype=torch.float32).to(DEVICE)
+        dataset = TensorDataset(Xt, yt)
+        loader = DataLoader(dataset, batch_size=max(8, BATCH_SIZE), shuffle=True)
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+        loss_fn = nn.MSELoss()
+        # small number of quick epochs
+        for _ in range(3):
+            for xb, yb in loader:
+                pred = model(xb)
+                loss = loss_fn(pred, yb)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        save_scaler_and_model(scaler, model)
+        logger.info("Incremental update done")
+        return scaler, model
     except Exception:
-        logger.exception("SGD partial_fit failed")
+        logger.exception("Incremental update failed")
+        return scaler, model
 
 # -------------------------
-# Prediction
+# Predict function wrapper
 # -------------------------
-def predict_next(window_prices):
-    """
-    Input: window_prices = numpy array of last LAG prices (oldest->newest)
-    Returns predicted_return, method (rf/sgd/none)
-    """
-    global sgd_model, rf_model, scaler
+def predict_next_return(window_prices, scaler, model):
     if window_prices is None or len(window_prices) < LAG:
-        return 0.0, "none"
+        return 0.0, 0.0  # return, confidence
     current = window_prices[-1]
-    rel_lags = (window_prices / window_prices[-1]) - 1.0
+    rel = (window_prices / (window_prices[-1] + 1e-12)) - 1.0
     sma = np.mean(window_prices[-SMA_PERIOD:]) if len(window_prices) >= SMA_PERIOD else np.mean(window_prices)
-    sma_gap = sma / current - 1.0
-    vol = np.std(window_prices) / (current + 1e-9)
-    feat = np.concatenate([rel_lags, [sma_gap, vol]]).reshape(1, -1)
+    sma_gap = sma / (current + 1e-12) - 1.0
+    vol = np.std(window_prices) / (current + 1e-12)
+    feat = np.concatenate([rel, [sma_gap, vol]]).reshape(1,-1)
     if scaler is None:
-        return 0.0, "none"
+        return 0.0, 0.0
     Xs = scaler.transform(feat)
-    # prefer rf if available
-    try:
-        if rf_model is not None:
-            p = rf_model.predict(Xs)[0]
-            return float(p), "rf"
-    except Exception:
-        logger.debug("RF predict failed")
-    try:
-        if sgd_model is not None:
-            p = sgd_model.predict(Xs)[0]
-            return float(p), "sgd"
-    except Exception:
-        logger.debug("SGD predict failed")
-    return 0.0, "none"
+    with torch.no_grad():
+        model.eval()
+        xt = torch.tensor(Xs, dtype=torch.float32).to(DEVICE)
+        pred = model(xt).cpu().numpy()[0][0]
+    # confidence estimate: inverse of absolute magnitude of prediction change (simple heuristic)
+    conf = max(0.0, 1.0 - min(1.0, abs(pred) * 50.0))  # scaled heuristic
+    return float(pred), float(conf)
 
 # -------------------------
-# Sentiment helper
+# Retrain scheduler (runs in background)
 # -------------------------
-def analyze_sentiment(text: str):
-    if sentiment_pipeline is None:
-        return None, None
-    try:
-        out = sentiment_pipeline(text[:512])[0]
-        return out.get("label"), float(out.get("score"))
-    except Exception:
-        logger.exception("Sentiment analysis failed")
-        return None, None
+def run_daily_retrain_lock():
+    """Checks last retrain timestamp; if older than RETRAIN_INTERVAL_SECONDS, runs full retrain."""
+    # load last retrain time
+    last_retrain = None
+    if os.path.exists(LAST_RETRAIN_FILE):
+        try:
+            with open(LAST_RETRAIN_FILE, "r") as f:
+                info = json.load(f)
+                last_retrain = datetime.fromisoformat(info.get("last_retrain"))
+        except Exception:
+            last_retrain = None
 
-# -------------------------
-# Discord helper
-# -------------------------
-def send_discord(text: str):
-    if not DISCORD_WEBHOOK:
-        logger.warning("Discord webhook not configured; skipping send.")
+    now = datetime.utcnow()
+    if last_retrain and (now - last_retrain).total_seconds() < RETRAIN_INTERVAL_SECONDS:
+        logger.info("No daily retrain needed. Last retrain at %s", last_retrain.isoformat())
         return
-    try:
-        requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=10)
-    except Exception:
-        logger.exception("Failed to send Discord message")
+
+    df = load_history_df()
+    X, y = build_features_targets(df, lag=LAG)
+    if X is None or X.shape[0] < MIN_SAMPLES_TO_TRAIN:
+        logger.info("Not enough data to retrain (have %d rows)", df.shape[0])
+        return
+
+    input_dim = X.shape[1]
+    # train full model
+    scaler, model = train_nn_full(X, y, input_dim)
+    # store last retrain time
+    with open(LAST_RETRAIN_FILE, "w") as f:
+        json.dump({"last_retrain": datetime.utcnow().isoformat()}, f)
 
 # -------------------------
 # Main loop
 # -------------------------
 def main_loop():
-    global samples_since_rf
-    load_models()
-    # initial online update if model files exist
-    online_update()
+    # load small metadata & model if exist
+    df = load_history_df()
+    X, y = build_features_targets(df, lag=LAG)
+    scaler = None
+    model = None
+    if X is not None:
+        input_dim = X.shape[1]
+        scaler, model = load_scaler_and_model(input_dim)
+        # if we have some existing model, run a quick incremental update on current full data
+        if model is not None:
+            try:
+                scaler, model = incremental_update(X, y, scaler, model)
+            except Exception:
+                pass
 
     while True:
         try:
             price = fetch_gold_price()
             if price is None:
-                logger.warning("No price fetched this cycle")
-                send_discord("⚠️ Could not fetch gold price this cycle.")
+                logger.warning("No price this cycle")
                 time.sleep(UPDATE_INTERVAL)
                 continue
 
-            # sentiment (optional)
-            sentiment_label, sentiment_score = analyze_sentiment(f"Gold price {price}") if sentiment_pipeline else (None, None)
+            append_price(price, ts=datetime.utcnow())
+            logger.info("Fetched price: %.2f", price)
 
-            # append to CSV
-            append_price(price, timestamp=datetime.utcnow(), sentiment_label=sentiment_label, sentiment_score=sentiment_score, predicted=None)
-
-            # load history and predict
-            df = load_history()
-            logger.info("History length: %d", len(df))
+            # reload recent history and predict
+            df = load_history_df()
             if len(df) >= LAG:
                 window = df["price"].values[-LAG:]
-                pred_ret, method = predict_next(window)
-                predicted_price = price * (1.0 + pred_ret)
-                msg = (f"Gold: ${price:.2f} | Predicted next: ${predicted_price:.2f} ({pred_ret*100:.3f}% via {method})\n"
-                       f"Sentiment: {sentiment_label} {('%.2f'%sentiment_score) if sentiment_score else ''}\n"
-                       f"Samples: {len(df)}")
+                # ensure model and scaler loaded; if not, attempt to load
+                if model is None or scaler is None:
+                    Xtmp, ytmp = build_features_targets(df, lag=LAG)
+                    if Xtmp is not None:
+                        scaler, model = load_scaler_and_model(Xtmp.shape[1])
+                if model is not None and scaler is not None:
+                    pred_ret, conf = predict_next_return(window, scaler, model)
+                    predicted_price = price * (1.0 + pred_ret)
+                    msg = f"Price: ${price:.2f} | Pred next: ${predicted_price:.2f} ({pred_ret*100:.3f}%) | Conf: {conf:.2f}"
+                else:
+                    msg = f"Price: ${price:.2f} | Model warming up..."
                 logger.info(msg)
-                send_discord(msg)
-                # update last row's predicted field
-                df = load_history()
-                if not df.empty:
-                    df.at[df.index[-1], "predicted"] = predicted_price
-                    df.to_csv(HISTORY_CSV, index=False)
+                if DISCORD_WEBHOOK:
+                    try:
+                        requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=8)
+                    except Exception:
+                        logger.exception("Failed to post to Discord")
+            else:
+                logger.info("Not enough history yet: %d/%d", len(df), LAG)
 
-            # online update with new data
-            online_update()
+            # After each data append, perform a cheap incremental update when possible
+            df2 = load_history_df()
+            X2, y2 = build_features_targets(df2, lag=LAG)
+            if X2 is not None:
+                if model is None:
+                    scaler, model = train_nn_full(X2, y2, X2.shape[1])
+                else:
+                    scaler, model = incremental_update(X2, y2, scaler, model)
 
-            # if enough new samples, retrain RandomForest
-            if samples_since_rf >= RF_RETRAIN_BATCH:
-                train_full()  # does reset samples_since_rf
-                # after RF retrain, reload models (rf_model set inside train_full)
-                load_models()
+            # Launch daily retrain in background if due
+            t = threading.Thread(target=run_daily_retrain_lock, daemon=True)
+            t.start()
 
         except Exception:
             logger.exception("Main loop error")
-            send_discord("⚠️ Bot error occurred; check logs.")
-
         time.sleep(UPDATE_INTERVAL)
 
 if __name__ == "__main__":
     try:
         main_loop()
     except KeyboardInterrupt:
-        logger.info("Shutting down; saving models")
-        save_models()
-    except Exception:
-        logger.exception("Fatal error; saving models")
-        save_models()
+        logger.info("Shutting down")
