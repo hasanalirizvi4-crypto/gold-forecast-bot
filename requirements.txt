@@ -1,6 +1,4 @@
-# core libraries
+requests
 discord-webhook
-requests==2.31.0
-pandas==2.2.2
-numpy==1.26.4
-pytz==2024.1
+transformers
+torch>=2.5.0
