@@ -1,11 +1,6 @@
-pip>=25.2
-setuptools>=70.0.0
-wheel>=0.44.0
+# core libraries
 discord.py==2.3.2
 requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
 pytz==2024.1
-beautifulsoup4==4.12.2
-huggingface-hub==0.24.6
-transformers==4.43.3
-sentencepiece==0.1.99
-safetensors==0.4.3
