@@ -1,6 +1,6 @@
-requests>=2.28.0
-pandas
-numpy
-scikit-learn
-joblib
+requests
+discord-webhook
+transformers
 torch
+sentencepiece
+accelerate
