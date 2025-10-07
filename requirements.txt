@@ -1,4 +1,5 @@
-flask
 requests
 numpy
-scikit-learn
+pandas
+pytz
+discord_webhook
