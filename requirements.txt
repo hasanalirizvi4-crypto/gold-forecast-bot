@@ -1,5 +1,11 @@
 requests
-numpy
-pandas
 pytz
-discord_webhook
+schedule
+pandas
+numpy
+matplotlib
+scikit-learn
+openai==1.3.0
+python-dotenv
+Flask
+gunicorn
