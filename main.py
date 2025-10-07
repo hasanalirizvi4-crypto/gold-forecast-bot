@@ -2,19 +2,19 @@ import requests
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 from discord_webhook import DiscordWebhook
 import pytz
 import logging
+from flask import Flask
 
 # ======================================
 # CONFIGURATION
 # ======================================
 DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147584167055464/thHmNTy5nncm4Dwe4GeZ5hXEh0p8ptuw0n6d1TzBdsufFwuo6Y3FViGfHJjwtMeBAbvk"
-GOLD_API_KEY = "goldapi-favtsmgcmdotp-io"      # for live XAU/USD price
-FINNHUB_API_KEY = "c3b6n2iad3i9vkl5e9lg"        # free candle data API
-UPDATE_INTERVAL = 60                            # seconds
+GOLD_API_KEY = "goldapi-favtsmgcmdotp-io"
+UPDATE_INTERVAL = 60  # seconds
 TIMEZONE = pytz.timezone("Asia/Karachi")
 
 # ======================================
@@ -22,47 +22,29 @@ TIMEZONE = pytz.timezone("Asia/Karachi")
 # ======================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# ======================================
+# FUNCTIONS
+# ======================================
 
-# ======================================
-# FETCH FUNCTIONS
-# ======================================
 def fetch_gold_price():
     """Fetch latest XAU/USD price from GoldAPI."""
     try:
         headers = {"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"}
-        r = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
-        if r.status_code == 200:
-            return float(r.json()["price"])
-        else:
-            logging.warning(f"⚠️ GoldAPI returned status {r.status_code}")
-    except Exception as e:
-        logging.error(f"❌ Error fetching gold price: {e}")
-    return None
-
-
-def fetch_candles(symbol="XAUUSD", interval="60"):
-    """Fetch 1h or 4h OHLC data from Finnhub."""
-    try:
-        url = f"https://finnhub.io/api/v1/forex/candle?symbol=OANDA:{symbol}&resolution={interval}&count=200&token={FINNHUB_API_KEY}"
-        r = requests.get(url, timeout=10)
+        url = "https://www.goldapi.io/api/XAU/USD"
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            if data["s"] == "ok":
-                df = pd.DataFrame({
-                    "time": [datetime.fromtimestamp(t, TIMEZONE) for t in data["t"]],
-                    "open": data["o"], "high": data["h"], "low": data["l"], "close": data["c"]
-                })
-                return df
-        logging.warning("⚠️ Could not fetch candles from Finnhub.")
+            return float(data["price"])
+        else:
+            logging.warning(f"⚠️ GoldAPI returned status {r.status_code}")
+            return None
     except Exception as e:
-        logging.error(f"❌ Error fetching candle data: {e}")
-    return None
+        logging.error(f"❌ Error fetching gold price: {e}")
+        return None
 
 
-# ======================================
-# ANALYSIS FUNCTIONS
-# ======================================
 def calculate_indicators(prices):
+    """Compute EMA, RSI, MACD, Bollinger Bands, and derive confidence score."""
     df = pd.DataFrame(prices, columns=["price"])
     df["ema_20"] = df["price"].ewm(span=20, adjust=False).mean()
     df["ema_50"] = df["price"].ewm(span=50, adjust=False).mean()
@@ -86,7 +68,7 @@ def calculate_indicators(prices):
     df["lower_band"] = df["sma_20"] - (df["stddev"] * 2)
 
     last = df.iloc[-1]
-    confidence = 50
+    confidence = 50  # baseline
 
     if last["ema_20"] > last["ema_50"]:
         confidence += 15
@@ -106,31 +88,23 @@ def calculate_indicators(prices):
         confidence -= 10
 
     trend = "📈 Bullish Momentum" if confidence >= 60 else "📉 Bearish Pressure" if confidence <= 40 else "⚖️ Neutral Zone"
-    return trend, round(confidence, 2), last["price"]
+    return trend, round(confidence, 2), last["price"], df
 
 
-def detect_zones(df):
-    """Detect simple order-block style zones from OHLC data."""
-    recent = df.tail(50)
-    highs = recent["high"].rolling(window=3, center=True).max()
-    lows = recent["low"].rolling(window=3, center=True).min()
-
-    potential_buy = lows.sort_values().head(3).tolist()
-    potential_sell = highs.sort_values(ascending=False).head(3).tolist()
-
-    buy_zone = f"{min(potential_buy):.2f} - {max(potential_buy):.2f}" if potential_buy else "N/A"
-    sell_zone = f"{min(potential_sell):.2f} - {max(potential_sell):.2f}" if potential_sell else "N/A"
-    return buy_zone, sell_zone
+def identify_zones(df):
+    """Identify potential buy/sell zones (support/resistance)."""
+    recent = df["price"].tail(100)
+    low_zone = recent.min()
+    high_zone = recent.max()
+    return low_zone, high_zone
 
 
-# ======================================
-# DISCORD FUNCTION
-# ======================================
-def send_discord_message(msg):
+def send_discord_message(message):
     try:
-        DiscordWebhook(url=DISCORD_WEBHOOK, content=msg).execute()
+        webhook = DiscordWebhook(url=DISCORD_WEBHOOK, content=message)
+        webhook.execute()
     except Exception as e:
-        logging.error(f"❌ Discord send error: {e}")
+        logging.error(f"❌ Failed to send Discord message: {e}")
 
 
 # ======================================
@@ -140,61 +114,71 @@ def start_bot():
     logging.info("🚀 Gold AI Tracker started")
     prices = []
     last_trend = None
-    last_summary_date = None
+    last_summary_time = datetime.now(TIMEZONE).date()
 
     while True:
         price = fetch_gold_price()
         if price:
             prices.append(price)
-            if len(prices) > 300:
+            if len(prices) > 200:
                 prices.pop(0)
 
             if len(prices) > 50:
-                trend, confidence, current_price = calculate_indicators(prices)
-                if trend != last_trend and (confidence >= 65 or confidence <= 35):
+                trend, confidence, current_price, df = calculate_indicators(prices)
+                low_zone, high_zone = identify_zones(df)
+
+                if trend != last_trend and (confidence >= 60 or confidence <= 40):
                     message = (
-                        f"💰 **Gold Market Alert (XAU/USD)**\n"
-                        f"💵 Price: **${current_price:.2f}**\n"
-                        f"📊 Trend: {trend}\n"
-                        f"🔮 Confidence: **{confidence}%**\n"
-                        f"🕐 Time: {datetime.now(TIMEZONE).strftime('%I:%M %p %Z')}\n"
-                        f"⚙️ Indicators aligned — potential **{'BUY 🟩' if 'Bullish' in trend else 'SELL 🟥'}** opportunity.\n"
-                        f"*(For educational insight only)*"
+                        f"💰 **Gold Market Update (XAU/USD)**\n"
+                        f"Price: **${current_price:.2f}**\n"
+                        f"Trend: {trend}\n"
+                        f"Confidence: **{confidence}%**\n"
+                        f"📊 Buy Zone: ~${low_zone:.2f}\n"
+                        f"📉 Sell Zone: ~${high_zone:.2f}\n"
+                        f"🕒 Time: {datetime.now(TIMEZONE).strftime('%I:%M %p %Z')}\n"
+                        f"⚙️ Indicators aligned — potential opportunity detected.\n"
+                        f"*(Educational insight — not financial advice)*"
                     )
                     send_discord_message(message)
                     last_trend = trend
 
             logging.info(f"💰 Updated Gold Price: {price}")
 
+        else:
+            logging.warning("⚠️ Could not fetch gold price from GoldAPI.")
+
         # Daily Summary at 12 AM PKT
         now = datetime.now(TIMEZONE)
-        if now.hour == 0 and (last_summary_date is None or now.date() != last_summary_date):
-            one_hr = fetch_candles("XAUUSD", "60")
-            four_hr = fetch_candles("XAUUSD", "240")
-            buy_zone_1h, sell_zone_1h = detect_zones(one_hr) if one_hr is not None else ("N/A", "N/A")
-            buy_zone_4h, sell_zone_4h = detect_zones(four_hr) if four_hr is not None else ("N/A", "N/A")
+        if now.hour == 0 and now.date() != last_summary_time:
+            if len(prices) > 50:
+                _, _, current_price, df = calculate_indicators(prices)
+                low_zone, high_zone = identify_zones(df)
 
-            summary = (
-                f"🕛 **Daily Gold Report ({now.strftime('%d %b %Y')})**\n"
-                f"💰 Closing Price: **${price:.2f if price else 'N/A'}**\n"
-                f"📈 Last Trend: {last_trend or 'N/A'}\n"
-                f"🟩 Potential Buy Zone (1H): {buy_zone_1h}\n"
-                f"🟥 Potential Sell Zone (1H): {sell_zone_1h}\n"
-                f"🟩 Potential Buy Zone (4H): {buy_zone_4h}\n"
-                f"🟥 Potential Sell Zone (4H): {sell_zone_4h}\n"
-                f"🤖 AI Observation: Market may show {'bullish' if 'Bullish' in (last_trend or '') else 'bearish' if 'Bearish' in (last_trend or '') else 'neutral'} tone tomorrow.\n"
-                f"⚠️ Watch news for manipulation signals.\n"
-                f"*(AI-generated summary for analytical purposes)*"
-            )
-            send_discord_message(summary)
-            last_summary_date = now.date()
+                summary = (
+                    f"🕛 **Daily Market Summary ({now.strftime('%d %b %Y')})**\n"
+                    f"- Closing Price: ${current_price:.2f}\n"
+                    f"- Last Trend: {last_trend or 'N/A'}\n"
+                    f"- Potential Buy Zone: ${low_zone:.2f}\n"
+                    f"- Potential Sell Zone: ${high_zone:.2f}\n"
+                    f"- AI Observation: Market showed {last_trend or 'neutral'} tendencies.\n"
+                    f"⚠️ Watch these zones tomorrow for possible reactions.\n"
+                    f"*(AI-generated analytical insight only)*"
+                )
+                send_discord_message(summary)
+                last_summary_time = now.date()
 
         time.sleep(UPDATE_INTERVAL)
 
 
 # ======================================
-# START
+# FLASK APP TO KEEP RENDER SERVICE LIVE
 # ======================================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "✅ Gold AI Tracker is running!"
+
 if __name__ == "__main__":
     threading.Thread(target=start_bot).start()
-
+    app.run(host="0.0.0.0", port=10000)
