@@ -1,5 +1,6 @@
 flask
 requests
 discord_webhook
+pandas
 schedule
-statistics; python_version>="3.8"
+numpy
