@@ -13,7 +13,7 @@ import statistics
 # -----------------------------
 DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL"
 API_URL = "https://api.metalpriceapi.com/v1/latest"
-API_KEY = "YOUR_API_KEY"  # Replace with your actual MetalPriceAPI key
+API_KEY = "goldapi-akhgqzsmgeyofq0-io"  # Replace with your actual MetalPriceAPI key
 
 app = Flask(__name__)
 
