@@ -1,5 +1,6 @@
-requests
 yfinance
-pandas
 numpy
-pytz
+pandas
+schedule
+requests
+
