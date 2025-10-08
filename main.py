@@ -13,7 +13,7 @@ import flask
 # CONFIGURATION
 # ======================================
 DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147584167055464/thHmNTy5nncm4Dwe4GeZ5hXEh0p8ptuw0n6d1TzBdsufFwuo6Y3FViGfHJjwtMeBAbvk"
-GOLD_API_KEY = "goldapi-favtsmgcmdotp-io"
+GOLD_API_KEY = "goldapi-akhgqzsmgeyofq0-io"
 UPDATE_INTERVAL = 60  # seconds
 TIMEZONE = pytz.timezone("Asia/Karachi")
 
