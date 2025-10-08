@@ -1,12 +1,5 @@
+flask
 requests
-pytz
+discord_webhook
 schedule
-pandas
-numpy
-matplotlib
-scikit-learn
-openai==1.3.0
-python-dotenv
-Flask
-gunicorn
-discord-webhook
+statistics; python_version>="3.8"
