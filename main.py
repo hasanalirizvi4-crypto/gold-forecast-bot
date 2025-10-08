@@ -5,8 +5,8 @@ import schedule
 from collections import deque
 
 # === CONFIG ===
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1424147584167055464/thHmNTy5nncm4Dwe4GeZ5hXEh0p8ptuw0n6d1TzBdsufFwuo6Y3FViGfHJjwtMeBAbvk"  # 🔹 Replace with your webhook
-METALS_API_KEY = "a255414b6c7af4586f3b4696bd444950"
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1424147584167055464/thHmNTy5nncm4Dwe4GeZ5hXEh0p8ptuw0n6d1TzBdsufFwuo6Y3FViGfHJjwtMeBAbvk"  # 🔹 Replace with your actual Discord webhook
+GOLD_API_KEY = "goldapi-favtsmgcmdotp-io"          # 🔹 Your GoldAPI.io key
 ALL_TIME_HIGH = 2430.50
 PRICE_CHANGE_THRESHOLD_PCT = 1.0
 HISTORY_LIMIT = 120
@@ -22,6 +22,7 @@ last_slow_sma = None
 
 
 def send_alert(title, message, color=0xFFD700):
+    """Send formatted alert message to Discord."""
     data = {
         "username": "GoldBot Lite 🦅",
         "embeds": [{
@@ -40,28 +41,22 @@ def send_alert(title, message, color=0xFFD700):
 
 
 def fetch_spot_gold():
-    """Fetch spot gold price (USD per XAU) from Metals API and fallback sources."""
-    # 1️⃣ Metals API
-    try:
-        url = f"https://metals-api.com/api/latest?access_key={METALS_API_KEY}&base=USD&symbols=XAU"
-        resp = requests.get(url, timeout=8).json()
-        rate = resp.get("rates", {}).get("XAU")
-        if rate:
-            price = 1 / rate if rate < 1 else rate
-            if price > 10:
-                return round(price, 2)
-    except Exception as e:
-        print("Metals API error:", e)
+    """Fetch real-time spot gold (XAU/USD) using GoldAPI.io."""
+    url = "https://www.goldapi.io/api/XAU/USD"
+    headers = {"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"}
 
-    # 2️⃣ Fallback public source
     try:
-        res = requests.get("https://api.exchangerate.host/convert?from=XAU&to=USD", timeout=8).json()
-        if res.get("result") and res["result"] > 10:
-            return round(float(res["result"]), 2)
-    except Exception as e:
-        print("Fallback API error:", e)
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
 
-    return None
+        if res.status_code == 200 and "price" in data:
+            return round(float(data["price"]), 2)
+        else:
+            print("GoldAPI error:", res.status_code, data)
+            return None
+    except Exception as e:
+        print("Fetch error:", e)
+        return None
 
 
 def sma(prices, window):
@@ -118,7 +113,7 @@ def analyze():
 
 
 def run():
-    send_alert("🤖 GoldBot Online", "Bot is now monitoring spot gold prices 24/7 🌍", 0x00FFFF)
+    send_alert("🤖 GoldBot Online", "Bot is now monitoring live gold prices (via GoldAPI.io) 🌍", 0x00FFFF)
     analyze()
     schedule.every(FETCH_INTERVAL_SECONDS).seconds.do(analyze)
 
