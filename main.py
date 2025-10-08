@@ -1,183 +1,181 @@
-import requests
+import time
+import threading
+import datetime
 import yfinance as yf
 import pandas as pd
-import numpy as np
-import time
-from datetime import datetime, timedelta
-import pytz
-from discord_webhook import DiscordWebhook
+import requests
+from flask import Flask
+from discord_webhook import DiscordWebhook, DiscordEmbed
 from bs4 import BeautifulSoup
-import threading
-import logging
+import schedule
 
-# ======================================================
+# ==========================
 # CONFIGURATION
-# ======================================================
-DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1424147584167055464/thHmNTy5nncm4Dwe4GeZ5hXEh0p8ptuw0n6d1TzBdsufFwuo6Y3FViGfHJjwtMeBAbvk"
-GOLD_API_KEY = "a255414b6c7af4586f3b4696bd444950"
-TIMEZONE = pytz.timezone("Asia/Karachi")
-UPDATE_INTERVAL = 60  # seconds
+# ==========================
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/your-current-webhook"
+BACKUP_API = "https://commodities-api.com/api/latest?access_key=your_api_key&base=USD&symbols=XAU"
+SYMBOL = "GC=F"  # Gold Futures symbol for Yahoo Finance
+FETCH_INTERVAL = 180  # seconds
+CACHE_EXPIRY = 120  # seconds
 
-# ======================================================
-# LOGGING
-# ======================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ==========================
+# GLOBALS
+# ==========================
+app = Flask(__name__)
+last_price = None
+cached_data = {"time": None, "price": None}
+ATH = 2430.0  # Example ATH, update this if needed
 
-# ======================================================
-# HELPER FUNCTIONS
-# ======================================================
-def send_discord(msg: str):
-    """Send formatted message to Discord."""
+
+# ==========================
+# DISCORD ALERT FUNCTION
+# ==========================
+def send_alert(title, message, color=0xFFD700):
     try:
-        webhook = DiscordWebhook(url=DISCORD_WEBHOOK, content=msg)
+        webhook = DiscordWebhook(url=DISCORD_WEBHOOK_URL)
+        embed = DiscordEmbed(title=title, description=message, color=color)
+        embed.set_timestamp()
+        embed.set_footer(text="Gold AI Forecast v3.1", icon_url="https://cdn-icons-png.flaticon.com/512/3876/3876066.png")
+        webhook.add_embed(embed)
         webhook.execute()
     except Exception as e:
-        logging.error(f"❌ Discord send error: {e}")
+        print(f"[ERROR] Discord alert failed: {e}")
 
-def fetch_yahoo_gold_price():
-    """Fetch gold price from Yahoo Finance."""
+
+# ==========================
+# PRICE FETCHING
+# ==========================
+def get_gold_price():
+    global cached_data
+    now = time.time()
+    if cached_data["time"] and (now - cached_data["time"] < CACHE_EXPIRY):
+        return cached_data["price"]
+
     try:
-        ticker = yf.Ticker("XAUUSD=X")
+        ticker = yf.Ticker(SYMBOL)
         data = ticker.history(period="1d", interval="1m")
-        if not data.empty:
-            return data["Close"].iloc[-1]
+        if data.empty:
+            raise ValueError("Empty data returned from Yahoo.")
+        price = float(data["Close"].iloc[-1])
+        cached_data = {"time": now, "price": price}
+        return price
     except Exception as e:
-        logging.error(f"❌ Yahoo fetch error: {e}")
-    return None
+        print(f"[ERROR] Yahoo fetch error: {e}")
+        # Backup
+        try:
+            res = requests.get(BACKUP_API, timeout=10)
+            js = res.json()
+            return float(js["data"]["rates"]["XAU"])
+        except Exception as e2:
+            print(f"[ERROR] Backup API failed: {e2}")
+            return None
 
-def fetch_goldapi_price():
-    """Fallback to GoldAPI."""
-    try:
-        headers = {"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"}
-        r = requests.get("https://www.goldapi.io/api/XAU/USD", headers=headers, timeout=10)
-        if r.status_code == 200:
-            return float(r.json()["price"])
-    except Exception as e:
-        logging.error(f"❌ GoldAPI error: {e}")
-    return None
 
-def get_forexfactory_news():
-    """Scrape high-impact forex news from Forex Factory."""
-    url = "https://www.forexfactory.com/calendar"
+# ==========================
+# LIQUIDITY ZONES
+# ==========================
+def analyze_liquidity(df):
+    high = df["High"].max()
+    low = df["Low"].min()
+    avg = (high + low) / 2
+    return high, low, avg
+
+
+# ==========================
+# FOREX FACTORY NEWS SCRAPER
+# ==========================
+def fetch_forex_news():
     try:
-        page = requests.get(url, timeout=10)
-        soup = BeautifulSoup(page.text, "html.parser")
-        events = []
-        for row in soup.find_all("tr", class_="calendar__row"):
-            if "high" in str(row):  # High impact news
-                time_tag = row.find("td", class_="calendar__time")
-                impact_tag = row.find("span", class_="impact")
-                event_tag = row.find("td", class_="calendar__event")
-                currency_tag = row.find("td", class_="calendar__currency")
-                if time_tag and event_tag and impact_tag:
-                    events.append(
-                        f"🕒 {time_tag.text.strip()} | 💥 {currency_tag.text.strip()} | {event_tag.text.strip()}"
-                    )
-        return events[:5] if events else []
+        url = "https://www.forexfactory.com/"
+        r = requests.get(url, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.select(".calendar__row")
+        news_list = []
+
+        for row in rows[:5]:
+            impact = row.select_one(".calendar__impact span")
+            title = row.select_one(".calendar__event-title")
+            currency = row.select_one(".calendar__currency")
+            if title and currency and impact:
+                news_list.append(f"{currency.text.strip()} | {impact['title']} | {title.text.strip()}")
+        return news_list
     except Exception as e:
-        logging.warning(f"⚠️ Could not fetch ForexFactory news: {e}")
+        print(f"[ERROR] Forex news fetch failed: {e}")
         return []
 
-def calculate_indicators(prices):
-    """Basic technicals: EMA, RSI, MACD, Bollinger Bands."""
-    df = pd.DataFrame(prices, columns=["price"])
-    df["ema20"] = df["price"].ewm(span=20).mean()
-    df["ema50"] = df["price"].ewm(span=50).mean()
-    delta = df["price"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(14).mean() / (loss.rolling(14).mean() + 1e-9)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    exp1, exp2 = df["price"].ewm(span=12).mean(), df["price"].ewm(span=26).mean()
-    df["macd"], df["signal"] = exp1 - exp2, exp1 - exp2
-    df["sma20"] = df["price"].rolling(20).mean()
-    df["std"] = df["price"].rolling(20).std()
-    df["upper"], df["lower"] = df["sma20"] + 2 * df["std"], df["sma20"] - 2 * df["std"]
-    last = df.iloc[-1]
 
-    conf = 50
-    if last["ema20"] > last["ema50"]: conf += 15
-    if last["rsi"] < 30: conf += 10
-    elif last["rsi"] > 70: conf -= 10
-    if last["price"] < last["lower"]: conf += 10
-    elif last["price"] > last["upper"]: conf -= 10
+# ==========================
+# ANALYSIS AND ALERT LOGIC
+# ==========================
+def analyze_and_alert():
+    global last_price
+    price = get_gold_price()
+    if not price:
+        print("[WARNING] ⚠️ Price fetch failed.")
+        return
 
-    trend = "📈 **Bullish Momentum**" if conf >= 60 else "📉 **Bearish Pressure**" if conf <= 40 else "⚖️ **Neutral Zone**"
-    return trend, round(conf, 2), last["price"]
+    print(f"[INFO] Current Gold Price: {price}")
 
-def detect_zones(data):
-    """Find potential buy/sell zones."""
-    highs, lows = data["High"], data["Low"]
-    buy_zone = round(lows.tail(5).mean(), 2)
-    sell_zone = round(highs.tail(5).mean(), 2)
-    return buy_zone, sell_zone
+    # Get last day's data
+    ticker = yf.Ticker(SYMBOL)
+    hist = ticker.history(period="2d")
+    if len(hist) < 2:
+        return
+    prev_high = hist["High"].iloc[-2]
+    prev_low = hist["Low"].iloc[-2]
 
-def detect_big_moves(df):
-    """Detect large price moves or ATH breaks."""
-    change = (df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2] * 100
-    alert = None
-    if abs(change) > 0.5:
-        alert = f"⚠️ **Big Move Alert!** Gold moved {change:.2f}% in last minute."
-    return alert
+    # Breakout detection
+    if price > ATH:
+        send_alert("🚀 NEW ALL-TIME HIGH!", f"Gold has just broken above the ATH at ${ATH:.2f}!\nCurrent Price: **${price:.2f}**")
+    elif price < prev_low:
+        send_alert("⚠️ New Daily Low", f"Gold just broke below yesterday's low of ${prev_low:.2f}!\nCurrent Price: **${price:.2f}**")
+    elif price > prev_high:
+        send_alert("📈 New Daily High", f"Gold has broken above yesterday's high of ${prev_high:.2f}!\nCurrent Price: **${price:.2f}**")
 
-# ======================================================
-# MAIN BOT
-# ======================================================
-def gold_bot():
-    logging.info("🚀 Gold AI Forecast v3.0 running...")
-    prices = []
-    last_trend = None
-    last_report_time = None
+    # Liquidity zones
+    high, low, avg = analyze_liquidity(hist)
+    liquidity_msg = f"💧 **Buy-Side Liquidity:** Above ${high:.2f}\n💧 **Sell-Side Liquidity:** Below ${low:.2f}\n📊 Fair Value Zone: Around ${avg:.2f}"
+    send_alert("💧 Liquidity Update", liquidity_msg)
 
-    send_discord("🤖 **Gold AI Bot Activated!** Tracking live XAU/USD price & market sentiment...")
+    last_price = price
+
+
+# ==========================
+# DAILY NEWS ALERT
+# ==========================
+def news_update():
+    news = fetch_forex_news()
+    if not news:
+        send_alert("📰 Daily News Update", "Could not fetch news today.")
+        return
+
+    formatted = "\n".join([f"• {n}" for n in news])
+    send_alert("📰 Gold Market News Update", f"Here are the top events likely to affect gold today:\n\n{formatted}")
+
+
+# ==========================
+# SCHEDULER
+# ==========================
+def schedule_jobs():
+    send_alert("✅ Bot Live", "Gold AI Forecast Bot v3.1 is now active and tracking markets.")
+    analyze_and_alert()
+    news_update()
+    schedule.every(FETCH_INTERVAL).seconds.do(analyze_and_alert)
+    schedule.every().day.at("00:00").do(news_update)
+    schedule.every().day.at("12:00").do(news_update)
 
     while True:
-        price = fetch_yahoo_gold_price() or fetch_goldapi_price()
-        if not price:
-            logging.warning("⚠️ Price fetch failed.")
-            time.sleep(UPDATE_INTERVAL)
-            continue
+        schedule.run_pending()
+        time.sleep(5)
 
-        prices.append(price)
-        if len(prices) > 200: prices.pop(0)
-        logging.info(f"💰 Price: {price}")
 
-        # Calculate indicators
-        if len(prices) > 50:
-            trend, conf, current = calculate_indicators(prices)
+# ==========================
+# FLASK APP
+# ==========================
+@app.route("/")
+def home():
+    return "🚀 Gold AI Forecast v3.1 is running."
 
-            if trend != last_trend and (conf >= 60 or conf <= 40):
-                send_discord(f"💎 **Gold Market Signal**\nPrice: ${current:.2f}\nTrend: {trend}\nConfidence: {conf}%")
-                last_trend = trend
-
-        # Check for daily and intraday reports
-        now = datetime.now(TIMEZONE)
-        if (now.hour == 0 or now.hour == 12) and (not last_report_time or now.date() != last_report_time.date() or abs((now - last_report_time).seconds) > 3600):
-            ticker = yf.Ticker("XAUUSD=X")
-            hist = ticker.history(period="5d", interval="1h")
-            buy_zone, sell_zone = detect_zones(hist)
-            alert = detect_big_moves(hist)
-
-            news = get_forexfactory_news()
-            news_text = "\n".join(news) if news else "No major news updates."
-
-            summary = (
-                f"📅 **Market Report ({now.strftime('%d %b %Y %I:%M %p')})**\n"
-                f"💰 Price: ${price:.2f}\n"
-                f"Trend: {last_trend or 'Neutral'} | Confidence: {conf if prices else 'N/A'}%\n"
-                f"📊 Zones → Buy: ${buy_zone} | Sell: ${sell_zone}\n"
-                f"📰 Key News:\n{news_text}\n\n"
-                f"{alert or ''}\n"
-                f"🤖 AI Outlook: Based on sentiment, liquidity zones suggest potential reaction around ${buy_zone}–${sell_zone}.\n"
-                f"*(Educational use only — not financial advice)*"
-            )
-            send_discord(summary)
-            last_report_time = now
-
-        time.sleep(UPDATE_INTERVAL)
-
-# ======================================================
-# ENTRY POINT
-# ======================================================
 if __name__ == "__main__":
-    threading.Thread(target=gold_bot).start()
+    threading.Thread(target=schedule_jobs, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000)
