@@ -1,8 +1,7 @@
 flask
-discord_webhook
 requests
 yfinance
-pandas
-numpy
 beautifulsoup4
-pytz
+pandas
+schedule
+discord_webhook
