@@ -1,7 +1,5 @@
-flask
 requests
 yfinance
-beautifulsoup4
 pandas
-schedule
-discord_webhook
+numpy
+pytz
