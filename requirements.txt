@@ -1,6 +1,8 @@
 flask
-requests
 discord_webhook
+requests
+yfinance
 pandas
-schedule
 numpy
+beautifulsoup4
+pytz
