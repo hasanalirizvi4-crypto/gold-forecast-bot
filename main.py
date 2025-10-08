@@ -5,7 +5,7 @@ import schedule
 from collections import deque
 
 # === CONFIG ===
-DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL"  # 🔹 Replace with your webhook
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1424147584167055464/thHmNTy5nncm4Dwe4GeZ5hXEh0p8ptuw0n6d1TzBdsufFwuo6Y3FViGfHJjwtMeBAbvk"  # 🔹 Replace with your webhook
 METALS_API_KEY = "a255414b6c7af4586f3b4696bd444950"
 ALL_TIME_HIGH = 2430.50
 PRICE_CHANGE_THRESHOLD_PCT = 1.0
